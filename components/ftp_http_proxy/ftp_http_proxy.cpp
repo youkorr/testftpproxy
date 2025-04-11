@@ -5,6 +5,7 @@
 #include <netdb.h>
 #include <cstring>
 #include <arpa/inet.h>
+#include "esp_task_wdt.h"
 
 static const char *TAG = "ftp_proxy";
 
@@ -13,7 +14,15 @@ namespace ftp_http_proxy {
 
 void FTPHTTPProxy::setup() {
   ESP_LOGI(TAG, "Initialisation du proxy FTP/HTTP");
+
+    // Register current task with watchdog
+  esp_task_wdt_init(30, true); // 30 second timeout, panic on timeout
+  esp_task_wdt_add(NULL); // Add current task
+  
   this->setup_http_server();
+
+void FTPHTTPProxy::loop() {
+  esp_task_wdt_reset();  
 }
 
 void FTPHTTPProxy::loop() {}
