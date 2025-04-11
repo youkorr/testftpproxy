@@ -24,6 +24,11 @@ class FTPHTTPProxy : public Component {
   // Point d'entrée public pour démarrer un téléchargement
   bool download_file(const std::string &remote_path, httpd_req_t *req);
 
+  // Nouvelles méthodes pour la gestion des fichiers distants
+  esp_err_t list_files_handler(httpd_req_t *req);
+  esp_err_t delete_file_handler(httpd_req_t *req);
+  esp_err_t upload_file_handler(httpd_req_t *req);
+
  protected:
   std::string ftp_server_;
   std::string username_;
