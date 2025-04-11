@@ -5,7 +5,8 @@
 #include <netdb.h>
 #include <cstring>
 #include <arpa/inet.h>
-#include "esp_task_wdt.h"
+#include <esp_task_wdt.h>
+#include <esp_timer.h>
 
 static const char *TAG = "ftp_proxy";
 
@@ -15,16 +16,39 @@ namespace ftp_http_proxy {
 void FTPHTTPProxy::setup() {
   ESP_LOGI(TAG, "Initialisation du proxy FTP/HTTP");
 
-  // Initialiser le watchdog timer
-  esp_task_wdt_init(30, true); // 30 second timeout, panic on timeout
-  esp_task_wdt_add(NULL);      // Ajouter la tâche actuelle au watchdog
+  // Configuration du watchdog timer
+  esp_task_wdt_config_t twdt_config = {
+      .timeout_ms = 30000,  // 30 secondes
+      .idle_core_mask = (1 << CONFIG_FREERTOS_NUMBER_OF_CORES) - 1,
+      .trigger_panic = true,
+  };
+  esp_task_wdt_init(&twdt_config);
+  esp_task_wdt_add(NULL);  // Ajouter la tâche actuelle
 
   this->setup_http_server();
 }
 
 void FTPHTTPProxy::loop() {
-  // Réinitialiser le watchdog timer régulièrement
+  // Réinitialiser le watchdog régulièrement
   esp_task_wdt_reset();
+}
+
+int FTPHTTPProxy::recv_with_timeout(int sock, void *buffer, size_t size, int timeout_ms) {
+  fd_set readfds;
+  struct timeval tv;
+  int ret;
+
+  FD_ZERO(&readfds);
+  FD_SET(sock, &readfds);
+
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+  ret = select(sock + 1, &readfds, NULL, NULL, &tv);
+  if (ret > 0) {
+    return recv(sock, (char *)buffer, size, 0);
+  }
+  return ret;  // 0 for timeout, -1 for error
 }
 
 bool FTPHTTPProxy::connect_to_ftp() {
@@ -90,24 +114,6 @@ bool FTPHTTPProxy::connect_to_ftp() {
   buffer[bytes_received] = '\0';
 
   return true;
-}
-
-int FTPHTTPProxy::recv_with_timeout(int sock, void *buffer, size_t size, int timeout_ms) {
-  fd_set readfds;
-  struct timeval tv;
-  int ret;
-
-  FD_ZERO(&readfds);
-  FD_SET(sock, &readfds);
-
-  tv.tv_sec = timeout_ms / 1000;
-  tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-  ret = select(sock + 1, &readfds, NULL, NULL, &tv);
-  if (ret > 0) {
-    return recv(sock, buffer, size, 0);
-  }
-  return ret; // 0 for timeout, -1 for error
 }
 
 bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *req) {
