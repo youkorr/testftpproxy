@@ -404,7 +404,7 @@ void FTPHTTPProxy::setup_http_server() {
   httpd_uri_t uri_proxy = {
     .uri       = "/*",
     .method    = HTTP_GET,
-    .handler   = http_req_handler,
+    .handler   = static_http_req_handler,  // Utilisation du wrapper statique
     .user_ctx  = this
   };
   httpd_register_uri_handler(server_, &uri_proxy);
@@ -412,7 +412,7 @@ void FTPHTTPProxy::setup_http_server() {
   httpd_uri_t uri_list = {
     .uri       = "/list",
     .method    = HTTP_GET,
-    .handler   = list_files_handler,
+    .handler   = static_list_files_handler,  // Utilisation du wrapper statique
     .user_ctx  = this
   };
   httpd_register_uri_handler(server_, &uri_list);
@@ -420,7 +420,7 @@ void FTPHTTPProxy::setup_http_server() {
   httpd_uri_t uri_delete = {
     .uri       = "/delete/*",
     .method    = HTTP_DELETE,
-    .handler   = delete_file_handler,
+    .handler   = static_delete_file_handler,  // Utilisation du wrapper statique
     .user_ctx  = this
   };
   httpd_register_uri_handler(server_, &uri_delete);
@@ -428,7 +428,7 @@ void FTPHTTPProxy::setup_http_server() {
   httpd_uri_t uri_upload = {
     .uri       = "/upload",
     .method    = HTTP_POST,
-    .handler   = upload_file_handler,
+    .handler   = static_upload_file_handler,  // Utilisation du wrapper statique
     .user_ctx  = this
   };
   httpd_register_uri_handler(server_, &uri_upload);
