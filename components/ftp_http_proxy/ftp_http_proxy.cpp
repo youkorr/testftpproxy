@@ -158,7 +158,16 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
       ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
       goto error;
     }
-    vTaskDelay(pdMS_TO_TICKS(1));
+      // Yield more frequently, especially for large transfers
+    if (bytes_received >= 4096) {
+      // For large chunks, give more time to the system
+      vTaskDelay(pdMS_TO_TICKS(5));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    
+    // Reset watchdog timer explicitly
+    esp_task_wdt_reset();
   }
 
   ::close(data_sock);
@@ -395,6 +404,9 @@ void FTPHTTPProxy::setup_http_server() {
   config.max_uri_handlers = 8;
   config.max_resp_headers = 20;
   config.stack_size = 12288;
+
+    // Set task priority higher
+  config.task_priority = tskIDLE_PRIORITY + 5;
 
   if (httpd_start(&server_, &config) != ESP_OK) {
     ESP_LOGE(TAG, "Échec du démarrage du serveur HTTP");
