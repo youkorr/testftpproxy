@@ -5,6 +5,7 @@
 #include <netdb.h>
 #include <cstring>
 #include <arpa/inet.h>
+#include "esp_task_wdt.h"
 
 static const char *TAG = "ftp_proxy";
 
@@ -13,10 +14,18 @@ namespace ftp_http_proxy {
 
 void FTPHTTPProxy::setup() {
   ESP_LOGI(TAG, "Initialisation du proxy FTP/HTTP");
+
+  // Initialiser le watchdog timer
+  esp_task_wdt_init(30, true); // 30 second timeout, panic on timeout
+  esp_task_wdt_add(NULL);      // Ajouter la tâche actuelle au watchdog
+
   this->setup_http_server();
 }
 
-void FTPHTTPProxy::loop() {}
+void FTPHTTPProxy::loop() {
+  // Réinitialiser le watchdog timer régulièrement
+  esp_task_wdt_reset();
+}
 
 bool FTPHTTPProxy::connect_to_ftp() {
   struct hostent *ftp_host = gethostbyname(ftp_server_.c_str());
@@ -24,17 +33,20 @@ bool FTPHTTPProxy::connect_to_ftp() {
     ESP_LOGE(TAG, "Échec de la résolution DNS");
     return false;
   }
+
   sock_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (sock_ < 0) {
     ESP_LOGE(TAG, "Échec de création du socket : %d", errno);
     return false;
   }
 
+  // Configurer le socket en mode non bloquant
+  int flags = fcntl(sock_, F_GETFL, 0);
+  fcntl(sock_, F_SETFL, flags | O_NONBLOCK);
+
   // Configuration du socket pour être plus robuste
   int flag = 1;
   setsockopt(sock_, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
-
-  // Augmenter la taille du buffer de réception
   int rcvbuf = 16384;
   setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
@@ -52,7 +64,7 @@ bool FTPHTTPProxy::connect_to_ftp() {
   }
 
   char buffer[256];
-  int bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  int bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
   if (bytes_received <= 0 || !strstr(buffer, "220 ")) {
     ESP_LOGE(TAG, "Message de bienvenue FTP non reçu");
     ::close(sock_);
@@ -64,20 +76,38 @@ bool FTPHTTPProxy::connect_to_ftp() {
   // Authentification
   snprintf(buffer, sizeof(buffer), "USER %s\r\n", username_.c_str());
   send(sock_, buffer, strlen(buffer), 0);
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
   buffer[bytes_received] = '\0';
 
   snprintf(buffer, sizeof(buffer), "PASS %s\r\n", password_.c_str());
   send(sock_, buffer, strlen(buffer), 0);
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
   buffer[bytes_received] = '\0';
 
   // Mode binaire
   send(sock_, "TYPE I\r\n", 8, 0);
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
   buffer[bytes_received] = '\0';
 
   return true;
+}
+
+int FTPHTTPProxy::recv_with_timeout(int sock, void *buffer, size_t size, int timeout_ms) {
+  fd_set readfds;
+  struct timeval tv;
+  int ret;
+
+  FD_ZERO(&readfds);
+  FD_SET(sock, &readfds);
+
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+  ret = select(sock + 1, &readfds, NULL, NULL, &tv);
+  if (ret > 0) {
+    return recv(sock, buffer, size, 0);
+  }
+  return ret; // 0 for timeout, -1 for error
 }
 
 bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *req) {
@@ -98,7 +128,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
 
   // Mode passif
   send(sock_, "PASV\r\n", 6, 0);
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
   if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif");
     goto error;
@@ -111,6 +141,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     ESP_LOGE(TAG, "Format PASV incorrect");
     goto error;
   }
+
   sscanf(pasv_start, "(%d,%d,%d,%d,%d,%d)", &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]);
   data_port = port[0] * 256 + port[1];
   ESP_LOGD(TAG, "Port de données: %d", data_port);
@@ -137,34 +168,61 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
 
   snprintf(buffer, sizeof(buffer), "RETR %s\r\n", remote_path.c_str());
   send(sock_, buffer, strlen(buffer), 0);
-
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
   if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
     ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
     goto error;
   }
   buffer[bytes_received] = '\0';
 
+  unsigned long transfer_start_time = esp_timer_get_time() / 1000;
+  size_t bytes_transferred = 0;
+  size_t last_progress_time = transfer_start_time;
+
   while (true) {
-    bytes_received = recv(data_sock, buffer, sizeof(buffer), 0);
+    bytes_received = recv_with_timeout(data_sock, buffer, sizeof(buffer), 5000);
     if (bytes_received <= 0) {
       if (bytes_received < 0) {
         ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
       }
       break;
     }
+
     esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
       goto error;
     }
-    vTaskDelay(pdMS_TO_TICKS(1));
+
+    bytes_transferred += bytes_received;
+    unsigned long current_time = esp_timer_get_time() / 1000;
+
+    // Log progress every 5 seconds
+    if (current_time - last_progress_time > 5000) {
+      ESP_LOGI(TAG, "Transfert en cours: %zu octets transférés", bytes_transferred);
+      last_progress_time = current_time;
+    }
+
+    // Check for stalled transfer (no progress for 30 seconds)
+    if (current_time - last_progress_time > 30000) {
+      ESP_LOGE(TAG, "Transfert bloqué, abandon");
+      goto error;
+    }
+
+    // Yield to the system
+    if (bytes_received >= 4096) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    // Reset watchdog timer explicitly
+    esp_task_wdt_reset();
   }
 
   ::close(data_sock);
   data_sock = -1;
-
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
   if (bytes_received > 0 && strstr(buffer, "226 ")) {
     success = true;
     buffer[bytes_received] = '\0';
@@ -174,7 +232,6 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   send(sock_, "QUIT\r\n", 6, 0);
   ::close(sock_);
   sock_ = -1;
-
   httpd_resp_send_chunk(req, NULL, 0);
   return success;
 
@@ -188,213 +245,18 @@ error:
   return false;
 }
 
-esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
-  std::string requested_path = req->uri;
-
-  if (!requested_path.empty() && requested_path[0] == '/') {
-    requested_path.erase(0, 1);
-  }
-
-  ESP_LOGI(TAG, "Requête reçue: %s", requested_path.c_str());
-
-  std::string extension = "";
-  size_t dot_pos = requested_path.find_last_of('.');
-  if (dot_pos != std::string::npos) {
-    extension = requested_path.substr(dot_pos);
-  }
-
-  std::string filename = requested_path;
-  size_t slash_pos = requested_path.find_last_of('/');
-  if (slash_pos != std::string::npos) {
-    filename = requested_path.substr(slash_pos + 1);
-  }
-
-  if (extension == ".mp3" || extension == ".wav" || extension == ".ogg") {
-    httpd_resp_set_type(req, "application/octet-stream");
-    std::string header = "attachment; filename=\"" + filename + "\"";
-    httpd_resp_set_hdr(req, "Content-Disposition", header.c_str());
-  } else if (extension == ".pdf") {
-    httpd_resp_set_type(req, "application/pdf");
-  } else if (extension == ".jpg" || extension == ".jpeg") {
-    httpd_resp_set_type(req, "image/jpeg");
-  } else if (extension == ".png") {
-    httpd_resp_set_type(req, "image/png");
-  } else {
-    httpd_resp_set_type(req, "application/octet-stream");
-    std::string header = "attachment; filename=\"" + filename + "\"";
-    httpd_resp_set_hdr(req, "Content-Disposition", header.c_str());
-  }
-
-  httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
-
-  for (const auto &configured_path : proxy->remote_paths_) {
-    if (requested_path == configured_path) {
-      if (proxy->download_file(configured_path, req)) {
-        return ESP_OK;
-      } else {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
-        return ESP_FAIL;
-      }
-    }
-  }
-
-  httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Fichier non trouvé");
-  return ESP_FAIL;
-}
-
-// Gestionnaire pour lister les fichiers
-esp_err_t FTPHTTPProxy::list_files_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
-  if (!proxy->connect_to_ftp()) {
-    ESP_LOGE(TAG, "Échec de connexion FTP");
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de connexion FTP");
-    return ESP_FAIL;
-  }
-
-  // Simulez une liste de fichiers distants (remplacez par une vraie implémentation)
-  std::vector<std::string> files = {"file1.txt", "image.jpg", "audio.mp3"};
-  std::string json = "[";
-  for (size_t i = 0; i < files.size(); ++i) {
-    json += "{\"name\":\"" + files[i] + "\"}";
-    if (i < files.size() - 1) json += ",";
-  }
-  json += "]";
-
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_send(req, json.c_str(), json.length());
-  return ESP_OK;
-}
-
-// Gestionnaire pour supprimer un fichier
-esp_err_t FTPHTTPProxy::delete_file_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
-  std::string file_name = req->uri + strlen("/delete/");
-  ESP_LOGI(TAG, "Suppression du fichier: %s", file_name.c_str());
-
-  if (!proxy->connect_to_ftp()) {
-    ESP_LOGE(TAG, "Échec de connexion FTP");
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de connexion FTP");
-    return ESP_FAIL;
-  }
-
-  char buffer[256];
-  snprintf(buffer, sizeof(buffer), "DELE %s\r\n", file_name.c_str());
-  send(proxy->sock_, buffer, strlen(buffer), 0);
-
-  int bytes_received = recv(proxy->sock_, buffer, sizeof(buffer) - 1, 0);
-  buffer[bytes_received] = '\0';
-
-  if (strstr(buffer, "250 ")) {
-    httpd_resp_send(req, "File deleted", HTTPD_RESP_USE_STRLEN);
-  } else {
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de suppression");
-  }
-
-  send(proxy->sock_, "QUIT\r\n", 6, 0);
-  ::close(proxy->sock_);
-  proxy->sock_ = -1;
-
-  return ESP_OK;
-}
-
-// Gestionnaire pour uploader un fichier
-esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
-  if (!proxy->connect_to_ftp()) {
-    ESP_LOGE(TAG, "Échec de connexion FTP");
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de connexion FTP");
-    return ESP_FAIL;
-  }
-
-  char boundary[100];
-  size_t boundary_len = httpd_req_get_hdr_value_len(req, "Content-Type");
-  if (boundary_len <= 0) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid Content-Type");
-    return ESP_FAIL;
-  }
-
-  std::string content_type;
-  content_type.resize(boundary_len);
-  httpd_req_get_hdr_value_str(req, "Content-Type", &content_type[0], boundary_len);
-
-  size_t pos = content_type.find("boundary=");
-  if (pos == std::string::npos) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Boundary not found");
-    return ESP_FAIL;
-  }
-
-  std::string boundary_str = content_type.substr(pos + 9);
-  std::string file_name;
-  std::string file_data;
-
-  char buffer[1024];
-  int ret, remaining = req->content_len;
-
-  while (remaining > 0) {
-    ret = httpd_req_recv(req, buffer, std::min(remaining, (int)sizeof(buffer)));
-    if (ret <= 0) {
-      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Error receiving data");
-      return ESP_FAIL;
-    }
-
-    remaining -= ret;
-    file_data.append(buffer, ret);
-  }
-
-  pos = file_data.find("filename=\"");
-  if (pos == std::string::npos) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Filename not found");
-    return ESP_FAIL;
-  }
-
-  size_t end_pos = file_data.find("\"", pos + 10);
-  file_name = file_data.substr(pos + 10, end_pos - pos - 10);
-
-  pos = file_data.find("\r\n\r\n");
-  if (pos == std::string::npos) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "File content not found");
-    return ESP_FAIL;
-  }
-
-  file_data = file_data.substr(pos + 4);
-  end_pos = file_data.rfind("--" + boundary_str + "--");
-  if (end_pos == std::string::npos) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid file content");
-    return ESP_FAIL;
-  }
-
-  file_data = file_data.substr(0, end_pos);
-
-  char buffer_cmd[256];
-  snprintf(buffer_cmd, sizeof(buffer_cmd), "STOR %s\r\n", file_name.c_str());
-  send(proxy->sock_, buffer_cmd, strlen(buffer_cmd), 0);
-
-  int bytes_sent = send(proxy->sock_, file_data.c_str(), file_data.length(), 0);
-  if (bytes_sent <= 0) {
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Error uploading file");
-    return ESP_FAIL;
-  }
-
-  httpd_resp_send(req, "File uploaded", HTTPD_RESP_USE_STRLEN);
-
-  send(proxy->sock_, "QUIT\r\n", 6, 0);
-  ::close(proxy->sock_);
-  proxy->sock_ = -1;
-
-  return ESP_OK;
-}
-
 void FTPHTTPProxy::setup_http_server() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = local_port_;
   config.uri_match_fn = httpd_uri_match_wildcard;
 
-  config.recv_wait_timeout = 20;
-  config.send_wait_timeout = 20;
+  // Augmenter les timeouts pour les gros fichiers
+  config.recv_wait_timeout = 60;
+  config.send_wait_timeout = 60;
   config.max_uri_handlers = 8;
   config.max_resp_headers = 20;
-  config.stack_size = 12288;
+  config.stack_size = 16384;
+  config.task_priority = tskIDLE_PRIORITY + 5;
 
   if (httpd_start(&server_, &config) != ESP_OK) {
     ESP_LOGE(TAG, "Échec du démarrage du serveur HTTP");
@@ -402,39 +264,35 @@ void FTPHTTPProxy::setup_http_server() {
   }
 
   httpd_uri_t uri_proxy = {
-    .uri       = "/*",
-    .method    = HTTP_GET,
-    .handler   = static_http_req_handler,  // Utilisation du wrapper statique
-    .user_ctx  = this
-  };
+      .uri = "/*",
+      .method = HTTP_GET,
+      .handler = static_http_req_handler,
+      .user_ctx = this};
   httpd_register_uri_handler(server_, &uri_proxy);
 
   httpd_uri_t uri_list = {
-    .uri       = "/list",
-    .method    = HTTP_GET,
-    .handler   = static_list_files_handler,  // Utilisation du wrapper statique
-    .user_ctx  = this
-  };
+      .uri = "/list",
+      .method = HTTP_GET,
+      .handler = static_list_files_handler,
+      .user_ctx = this};
   httpd_register_uri_handler(server_, &uri_list);
 
   httpd_uri_t uri_delete = {
-    .uri       = "/delete/*",
-    .method    = HTTP_DELETE,
-    .handler   = static_delete_file_handler,  // Utilisation du wrapper statique
-    .user_ctx  = this
-  };
+      .uri = "/delete/*",
+      .method = HTTP_DELETE,
+      .handler = static_delete_file_handler,
+      .user_ctx = this};
   httpd_register_uri_handler(server_, &uri_delete);
 
   httpd_uri_t uri_upload = {
-    .uri       = "/upload",
-    .method    = HTTP_POST,
-    .handler   = static_upload_file_handler,  // Utilisation du wrapper statique
-    .user_ctx  = this
-  };
+      .uri = "/upload",
+      .method = HTTP_POST,
+      .handler = static_upload_file_handler,
+      .user_ctx = this};
   httpd_register_uri_handler(server_, &uri_upload);
 
   ESP_LOGI(TAG, "Serveur HTTP démarré sur le port %d", local_port_);
 }
 
-}  // namespace ftp_http_proxy
-}  // namespace esphome
+} // namespace ftp_http_proxy
+} // namespace esphome
