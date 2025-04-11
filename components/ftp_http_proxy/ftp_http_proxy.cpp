@@ -136,7 +136,6 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   }
 
   snprintf(buffer, sizeof(buffer), "RETR %s\r\n", remote_path.c_str());
-  ESP_LOGD(TAG, "Envoi de la commande: %s", buffer);
   send(sock_, buffer, strlen(buffer), 0);
 
   bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
@@ -246,7 +245,8 @@ esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
 
 // Gestionnaire pour lister les fichiers
 esp_err_t FTPHTTPProxy::list_files_handler(httpd_req_t *req) {
-  if (!connect_to_ftp()) {
+  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  if (!proxy->connect_to_ftp()) {
     ESP_LOGE(TAG, "Échec de connexion FTP");
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de connexion FTP");
     return ESP_FAIL;
@@ -268,10 +268,11 @@ esp_err_t FTPHTTPProxy::list_files_handler(httpd_req_t *req) {
 
 // Gestionnaire pour supprimer un fichier
 esp_err_t FTPHTTPProxy::delete_file_handler(httpd_req_t *req) {
+  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
   std::string file_name = req->uri + strlen("/delete/");
   ESP_LOGI(TAG, "Suppression du fichier: %s", file_name.c_str());
 
-  if (!connect_to_ftp()) {
+  if (!proxy->connect_to_ftp()) {
     ESP_LOGE(TAG, "Échec de connexion FTP");
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de connexion FTP");
     return ESP_FAIL;
@@ -279,9 +280,9 @@ esp_err_t FTPHTTPProxy::delete_file_handler(httpd_req_t *req) {
 
   char buffer[256];
   snprintf(buffer, sizeof(buffer), "DELE %s\r\n", file_name.c_str());
-  send(sock_, buffer, strlen(buffer), 0);
+  send(proxy->sock_, buffer, strlen(buffer), 0);
 
-  int bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  int bytes_received = recv(proxy->sock_, buffer, sizeof(buffer) - 1, 0);
   buffer[bytes_received] = '\0';
 
   if (strstr(buffer, "250 ")) {
@@ -290,16 +291,17 @@ esp_err_t FTPHTTPProxy::delete_file_handler(httpd_req_t *req) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de suppression");
   }
 
-  send(sock_, "QUIT\r\n", 6, 0);
-  ::close(sock_);
-  sock_ = -1;
+  send(proxy->sock_, "QUIT\r\n", 6, 0);
+  ::close(proxy->sock_);
+  proxy->sock_ = -1;
 
   return ESP_OK;
 }
 
 // Gestionnaire pour uploader un fichier
 esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
-  if (!connect_to_ftp()) {
+  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  if (!proxy->connect_to_ftp()) {
     ESP_LOGE(TAG, "Échec de connexion FTP");
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de connexion FTP");
     return ESP_FAIL;
@@ -340,7 +342,6 @@ esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
     file_data.append(buffer, ret);
   }
 
-  // Extraire le nom du fichier et les données
   pos = file_data.find("filename=\"");
   if (pos == std::string::npos) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Filename not found");
@@ -365,12 +366,11 @@ esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
 
   file_data = file_data.substr(0, end_pos);
 
-  // Upload vers FTP
   char buffer_cmd[256];
   snprintf(buffer_cmd, sizeof(buffer_cmd), "STOR %s\r\n", file_name.c_str());
-  send(sock_, buffer_cmd, strlen(buffer_cmd), 0);
+  send(proxy->sock_, buffer_cmd, strlen(buffer_cmd), 0);
 
-  int bytes_sent = send(sock_, file_data.c_str(), file_data.length(), 0);
+  int bytes_sent = send(proxy->sock_, file_data.c_str(), file_data.length(), 0);
   if (bytes_sent <= 0) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Error uploading file");
     return ESP_FAIL;
@@ -378,9 +378,9 @@ esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
 
   httpd_resp_send(req, "File uploaded", HTTPD_RESP_USE_STRLEN);
 
-  send(sock_, "QUIT\r\n", 6, 0);
-  ::close(sock_);
-  sock_ = -1;
+  send(proxy->sock_, "QUIT\r\n", 6, 0);
+  ::close(proxy->sock_);
+  proxy->sock_ = -1;
 
   return ESP_OK;
 }
