@@ -15,17 +15,21 @@ namespace ftp_http_proxy {
 void FTPHTTPProxy::setup() {
   ESP_LOGI(TAG, "Initialisation du proxy FTP/HTTP");
 
-    // Register current task with watchdog
-  esp_task_wdt_init(30, true); // 30 second timeout, panic on timeout
+  // Initialize Task Watchdog Timer with new API
+  esp_task_wdt_config_t twdt_config = {
+    .timeout_ms = 30000,  // 30 second timeout
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,  // Check all cores
+    .trigger_panic = true  // Panic on timeout
+  };
+  esp_task_wdt_init(&twdt_config);
   esp_task_wdt_add(NULL); // Add current task
   
   this->setup_http_server();
+}
 
 void FTPHTTPProxy::loop() {
   esp_task_wdt_reset();  
 }
-
-void FTPHTTPProxy::loop() {}
 
 bool FTPHTTPProxy::connect_to_ftp() {
   struct hostent *ftp_host = gethostbyname(ftp_server_.c_str());
@@ -167,9 +171,9 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
       ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
       goto error;
     }
-      // Yield more frequently, especially for large transfers
+    
+    // Yield more frequently, especially for large transfers
     if (bytes_received >= 4096) {
-      // For large chunks, give more time to the system
       vTaskDelay(pdMS_TO_TICKS(5));
     } else {
       vTaskDelay(pdMS_TO_TICKS(1));
@@ -261,7 +265,6 @@ esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   return ESP_FAIL;
 }
 
-// Gestionnaire pour lister les fichiers
 esp_err_t FTPHTTPProxy::list_files_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
   if (!proxy->connect_to_ftp()) {
@@ -284,7 +287,6 @@ esp_err_t FTPHTTPProxy::list_files_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
-// Gestionnaire pour supprimer un fichier
 esp_err_t FTPHTTPProxy::delete_file_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
   std::string file_name = req->uri + strlen("/delete/");
@@ -316,7 +318,6 @@ esp_err_t FTPHTTPProxy::delete_file_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
-// Gestionnaire pour uploader un fichier
 esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
   if (!proxy->connect_to_ftp()) {
@@ -414,7 +415,7 @@ void FTPHTTPProxy::setup_http_server() {
   config.max_resp_headers = 20;
   config.stack_size = 12288;
 
-    // Set task priority higher
+  // Set task priority higher
   config.task_priority = tskIDLE_PRIORITY + 5;
 
   if (httpd_start(&server_, &config) != ESP_OK) {
