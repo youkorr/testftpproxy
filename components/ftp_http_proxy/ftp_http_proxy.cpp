@@ -121,138 +121,142 @@ bool FTPHTTPProxy::connect_to_ftp() {
 }
 
 bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *req) {
-  int data_sock = -1;
-  bool success = false;
-  char *pasv_start = nullptr;
-  int data_port = 0;
-  int ip[4], port[2];
-  char buffer[8192];
-  int bytes_received;
-  int flag = 1;
-  int rcvbuf = 16384;
+    int data_sock = -1;
+    bool success = false;
+    char *pasv_start = nullptr;
+    int data_port = 0;
+    int ip[4], port[2];
+    char buffer[8192];
+    int bytes_received = 0;
+    int flag = 1;
+    int rcvbuf = 16384;
 
-  if (!connect_to_ftp()) {
-    ESP_LOGE(TAG, "Échec de connexion FTP");
-    goto error;
-  }
+    unsigned long transfer_start_time = 0;
+    size_t bytes_transferred = 0;
+    size_t last_progress_time = 0;
 
-  // Mode passif
-  send(sock_, "PASV\r\n", 6, 0);
-  bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
-  if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
-    ESP_LOGE(TAG, "Erreur en mode passif");
-    goto error;
-  }
-  buffer[bytes_received] = '\0';
-  ESP_LOGD(TAG, "Réponse PASV: %s", buffer);
-
-  pasv_start = strchr(buffer, '(');
-  if (!pasv_start) {
-    ESP_LOGE(TAG, "Format PASV incorrect");
-    goto error;
-  }
-
-  sscanf(pasv_start, "(%d,%d,%d,%d,%d,%d)", &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]);
-  data_port = port[0] * 256 + port[1];
-  ESP_LOGD(TAG, "Port de données: %d", data_port);
-
-  data_sock = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (data_sock < 0) {
-    ESP_LOGE(TAG, "Échec de création du socket de données");
-    goto error;
-  }
-
-  setsockopt(data_sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
-  setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
-  struct sockaddr_in data_addr;
-  memset(&data_addr, 0, sizeof(data_addr));
-  data_addr.sin_family = AF_INET;
-  data_addr.sin_port = htons(data_port);
-  data_addr.sin_addr.s_addr = htonl((ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3]);
-
-  if (::connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
-    ESP_LOGE(TAG, "Échec de connexion au port de données");
-    goto error;
-  }
-
-  snprintf(buffer, sizeof(buffer), "RETR %s\r\n", remote_path.c_str());
-  send(sock_, buffer, strlen(buffer), 0);
-  bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
-  if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
-    ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
-    goto error;
-  }
-  buffer[bytes_received] = '\0';
-
-  unsigned long transfer_start_time = esp_timer_get_time() / 1000;
-  size_t bytes_transferred = 0;
-  size_t last_progress_time = transfer_start_time;
-
-  while (true) {
-    bytes_received = recv_with_timeout(data_sock, buffer, sizeof(buffer), 5000);
-    if (bytes_received <= 0) {
-      if (bytes_received < 0) {
-        ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
-      }
-      break;
+    if (!connect_to_ftp()) {
+        ESP_LOGE(TAG, "Échec de connexion FTP");
+        goto error;
     }
 
-    esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
-      goto error;
+    // Mode passif
+    send(sock_, "PASV\r\n", 6, 0);
+    bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
+    if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
+        ESP_LOGE(TAG, "Erreur en mode passif");
+        goto error;
     }
-
-    bytes_transferred += bytes_received;
-    unsigned long current_time = esp_timer_get_time() / 1000;
-
-    // Log progress every 5 seconds
-    if (current_time - last_progress_time > 5000) {
-      ESP_LOGI(TAG, "Transfert en cours: %zu octets transférés", bytes_transferred);
-      last_progress_time = current_time;
-    }
-
-    // Check for stalled transfer (no progress for 30 seconds)
-    if (current_time - last_progress_time > 30000) {
-      ESP_LOGE(TAG, "Transfert bloqué, abandon");
-      goto error;
-    }
-
-    // Yield to the system
-    if (bytes_received >= 4096) {
-      vTaskDelay(pdMS_TO_TICKS(5));
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(1));
-    }
-
-    // Reset watchdog timer explicitly
-    esp_task_wdt_reset();
-  }
-
-  ::close(data_sock);
-  data_sock = -1;
-  bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
-  if (bytes_received > 0 && strstr(buffer, "226 ")) {
-    success = true;
     buffer[bytes_received] = '\0';
-    ESP_LOGD(TAG, "Transfert terminé: %s", buffer);
-  }
+    ESP_LOGD(TAG, "Réponse PASV: %s", buffer);
 
-  send(sock_, "QUIT\r\n", 6, 0);
-  ::close(sock_);
-  sock_ = -1;
-  httpd_resp_send_chunk(req, NULL, 0);
-  return success;
+    pasv_start = strchr(buffer, '(');
+    if (!pasv_start) {
+        ESP_LOGE(TAG, "Format PASV incorrect");
+        goto error;
+    }
 
-error:
-  if (data_sock != -1) ::close(data_sock);
-  if (sock_ != -1) {
+    sscanf(pasv_start, "(%d,%d,%d,%d,%d,%d)", &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]);
+    data_port = port[0] * 256 + port[1];
+    ESP_LOGD(TAG, "Port de données: %d", data_port);
+
+    data_sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (data_sock < 0) {
+        ESP_LOGE(TAG, "Échec de création du socket de données");
+        goto error;
+    }
+
+    setsockopt(data_sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+    setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    struct sockaddr_in data_addr;
+    memset(&data_addr, 0, sizeof(data_addr));
+    data_addr.sin_family = AF_INET;
+    data_addr.sin_port = htons(data_port);
+    data_addr.sin_addr.s_addr = htonl((ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3]);
+
+    if (::connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
+        ESP_LOGE(TAG, "Échec de connexion au port de données");
+        goto error;
+    }
+
+    snprintf(buffer, sizeof(buffer), "RETR %s\r\n", remote_path.c_str());
+    send(sock_, buffer, strlen(buffer), 0);
+    bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
+    if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
+        ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
+        goto error;
+    }
+    buffer[bytes_received] = '\0';
+
+    transfer_start_time = esp_timer_get_time() / 1000;
+    bytes_transferred = 0;
+    last_progress_time = transfer_start_time;
+
+    while (true) {
+        bytes_received = recv_with_timeout(data_sock, buffer, sizeof(buffer), 5000);
+        if (bytes_received <= 0) {
+            if (bytes_received < 0) {
+                ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
+            }
+            break;
+        }
+
+        esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
+            goto error;
+        }
+
+        bytes_transferred += bytes_received;
+        unsigned long current_time = esp_timer_get_time() / 1000;
+
+        // Log progress every 5 seconds
+        if (current_time - last_progress_time > 5000) {
+            ESP_LOGI(TAG, "Transfert en cours: %zu octets transférés", bytes_transferred);
+            last_progress_time = current_time;
+        }
+
+        // Check for stalled transfer (no progress for 30 seconds)
+        if (current_time - last_progress_time > 30000) {
+            ESP_LOGE(TAG, "Transfert bloqué, abandon");
+            goto error;
+        }
+
+        // Yield to the system
+        if (bytes_received >= 4096) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        // Reset watchdog timer explicitly
+        esp_task_wdt_reset();
+    }
+
+    ::close(data_sock);
+    data_sock = -1;
+    bytes_received = recv_with_timeout(sock_, buffer, sizeof(buffer) - 1, 5000);
+    if (bytes_received > 0 && strstr(buffer, "226 ")) {
+        success = true;
+        buffer[bytes_received] = '\0';
+        ESP_LOGD(TAG, "Transfert terminé: %s", buffer);
+    }
+
     send(sock_, "QUIT\r\n", 6, 0);
     ::close(sock_);
     sock_ = -1;
-  }
-  return false;
+    httpd_resp_send_chunk(req, NULL, 0);
+    return success;
+
+error:
+    if (data_sock != -1) ::close(data_sock);
+    if (sock_ != -1) {
+        send(sock_, "QUIT\r\n", 6, 0);
+        ::close(sock_);
+        sock_ = -1;
+    }
+    return false;
 }
 
 void FTPHTTPProxy::setup_http_server() {
