@@ -17,6 +17,10 @@ void FTPHTTPProxy::setup() {
   ESP_LOGI(TAG, "Initialisation du proxy FTP/HTTP");
 
   // Configuration du watchdog timer
+#ifndef CONFIG_FREERTOS_NUMBER_OF_CORES
+#define CONFIG_FREERTOS_NUMBER_OF_CORES 2  // Valeur par défaut pour ESP32
+#endif
+
   esp_task_wdt_config_t twdt_config = {
       .timeout_ms = 30000,  // 30 secondes
       .idle_core_mask = (1 << CONFIG_FREERTOS_NUMBER_OF_CORES) - 1,
