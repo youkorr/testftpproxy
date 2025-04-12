@@ -119,10 +119,23 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   int ip[4], port[2];
   int bytes_received;
   int flag = 1;
-  int rcvbuf = 32768;  // Augmenté pour SPIRAM
+  int rcvbuf = 32768;
 
+  // Détecter si c'est un fichier média
+  std::string extension = "";
+  size_t dot_pos = remote_path.find_last_of('.');
+  if (dot_pos != std::string::npos) {
+    extension = remote_path.substr(dot_pos);
+  }
+
+  bool is_media_file = (extension == ".mp3" || extension == ".mp4" || 
+                        extension == ".wav" || extension == ".ogg");
+
+  // Réduire la taille du buffer pour les fichiers média pour un streaming plus fluide
+  int buffer_size = is_media_file ? 4096 : 8192;
+  
   // Allouer le buffer en SPIRAM
-  char* buffer = (char*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+  char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
   if (!buffer) {
     ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
     return false;
@@ -133,9 +146,25 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     goto error;
   }
 
+  // Configuration spéciale pour les fichiers média
+  if (is_media_file) {
+    // Configuration correcte du type MIME
+    if (extension == ".mp3") {
+      httpd_resp_set_type(req, "audio/mpeg");
+    } else if (extension == ".wav") {
+      httpd_resp_set_type(req, "audio/wav");
+    } else if (extension == ".ogg") {
+      httpd_resp_set_type(req, "audio/ogg");
+    } else if (extension == ".mp4") {
+      httpd_resp_set_type(req, "video/mp4");
+    }
+    // Permet la mise en mémoire tampon côté client
+    httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
+  }
+
   // Mode passif
   send(sock_, "PASV\r\n", 6, 0);
-  bytes_received = recv(sock_, buffer, 8191, 0);
+  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif");
     goto error;
@@ -172,33 +201,44 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     goto error;
   }
 
-  snprintf(buffer, 8192, "RETR %s\r\n", remote_path.c_str());
+  snprintf(buffer, buffer_size, "RETR %s\r\n", remote_path.c_str());
   send(sock_, buffer, strlen(buffer), 0);
 
-  bytes_received = recv(sock_, buffer, 8191, 0);
+  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
     ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
     goto error;
   }
   buffer[bytes_received] = '\0';
 
+  // Streaming avec des chunks plus petits pour les fichiers média
+  int chunk_count = 0;
   while (true) {
-    bytes_received = recv(data_sock, buffer, 8192, 0);
+    bytes_received = recv(data_sock, buffer, buffer_size, 0);
     if (bytes_received <= 0) {
       if (bytes_received < 0) {
         ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
       }
       break;
     }
+    
     esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
       goto error;
     }
     
-    // Yield plus fréquemment, surtout pour les grands transferts
-    if (bytes_received >= 4096) {
+    // Comptez les chunks pour les fichiers média pour surveiller la progression
+    if (is_media_file) {
+      chunk_count++;
+      if (chunk_count % 10 == 0) {
+        ESP_LOGD(TAG, "Streaming média: %d chunks envoyés", chunk_count);
+      }
+      
+      // Yield plus souvent pour les fichiers média
       vTaskDelay(pdMS_TO_TICKS(5));
+    } else if (bytes_received >= buffer_size/2) {
+      vTaskDelay(pdMS_TO_TICKS(3));
     } else {
       vTaskDelay(pdMS_TO_TICKS(1));
     }
@@ -210,7 +250,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   ::close(data_sock);
   data_sock = -1;
 
-  bytes_received = recv(sock_, buffer, 8191, 0);
+  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received > 0 && strstr(buffer, "226 ")) {
     success = true;
     buffer[bytes_received] = '\0';
@@ -237,6 +277,7 @@ error:
   }
   return false;
 }
+
 
 esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
