@@ -147,8 +147,8 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   }
 
   bool is_media_file = (extension == ".mp3" || extension == ".mp4" || 
-                        extension == ".wav" || extension == ".ogg");
-
+                        extension == ".wav" || extension == ".ogg" || 
+                        extension == ".avi");
   // Réduire encore plus la taille du buffer pour les fichiers média
   int buffer_size = is_media_file ? 2048 : 8192;
   
@@ -169,17 +169,17 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   }
 
   // Configuration spéciale pour les fichiers média
-  if (is_media_file) {
-    // Configuration correcte du type MIME
-    if (extension == ".mp3") {
+  if (extension == ".mp3") {
       httpd_resp_set_type(req, "audio/mpeg");
-    } else if (extension == ".wav") {
+  } else if (extension == ".wav") {
       httpd_resp_set_type(req, "audio/wav");
-    } else if (extension == ".ogg") {
+  } else if (extension == ".ogg") {
       httpd_resp_set_type(req, "audio/ogg");
-    } else if (extension == ".mp4") {
+  } else if (extension == ".mp4") {
       httpd_resp_set_type(req, "video/mp4");
-    }
+  } else if (extension == ".avi") {
+      httpd_resp_set_type(req, "video/x-msvideo"); // Type MIME standard pour AVI
+  }
     // Permet la mise en mémoire tampon côté client
     httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
   }
@@ -348,19 +348,23 @@ esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   }
 
   if (extension == ".mp3" || extension == ".wav" || extension == ".ogg") {
-    httpd_resp_set_type(req, "application/octet-stream");
-    std::string header = "attachment; filename=\"" + filename + "\"";
-    httpd_resp_set_hdr(req, "Content-Disposition", header.c_str());
+      httpd_resp_set_type(req, "application/octet-stream");
+      std::string header = "attachment; filename=\"" + filename + "\"";
+      httpd_resp_set_hdr(req, "Content-Disposition", header.c_str());
   } else if (extension == ".pdf") {
-    httpd_resp_set_type(req, "application/pdf");
+      httpd_resp_set_type(req, "application/pdf");
   } else if (extension == ".jpg" || extension == ".jpeg") {
-    httpd_resp_set_type(req, "image/jpeg");
+      httpd_resp_set_type(req, "image/jpeg");
   } else if (extension == ".png") {
-    httpd_resp_set_type(req, "image/png");
+      httpd_resp_set_type(req, "image/png");
+  } else if (extension == ".avi") { // Ajout pour .avi
+      httpd_resp_set_type(req, "video/x-msvideo");
+      std::string header = "attachment; filename=\"" + filename + "\"";
+      httpd_resp_set_hdr(req, "Content-Disposition", header.c_str());
   } else {
-    httpd_resp_set_type(req, "application/octet-stream");
-    std::string header = "attachment; filename=\"" + filename + "\"";
-    httpd_resp_set_hdr(req, "Content-Disposition", header.c_str());
+      httpd_resp_set_type(req, "application/octet-stream");
+      std::string header = "attachment; filename=\"" + filename + "\"";
+      httpd_resp_set_hdr(req, "Content-Disposition", header.c_str());
   }
 
   httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
