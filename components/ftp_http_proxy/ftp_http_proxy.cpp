@@ -189,7 +189,15 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
 
   if (!connect_to_ftp()) {
     ESP_LOGE(TAG, "Échec de connexion FTP");
-    goto error;
+    // Nettoyer les ressources
+    if (buffer) {
+      heap_caps_free(buffer);
+    }
+    if (wdt_initialized) {
+      esp_task_wdt_delete(current_task);
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+    return false;
   }
 
   // Configuration des headers HTTP pour les fichiers média
@@ -227,25 +235,64 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   // Attendre la réponse avec un timeout
   FD_ZERO(&read_set);
   FD_SET(sock_, &read_set);
-  timeout.tv_sec = 5;  // 5 secondes de timeout
+  timeout.tv_sec = 5;  // 5 secondes de timeout - FIXED: a5 -> 5
   timeout.tv_usec = 0;
   select_res = ::select(sock_ + 1, &read_set, NULL, NULL, &timeout);
   
   if (select_res <= 0) {
     ESP_LOGE(TAG, "Timeout ou erreur en attente de réponse PASV");
-    goto error;
+    // Nettoyer les ressources
+    if (buffer) {
+      heap_caps_free(buffer);
+    }
+    if (sock_ != -1) {
+      send(sock_, "QUIT\r\n", 6, 0);
+      ::close(sock_);
+      sock_ = -1;
+    }
+    if (wdt_initialized) {
+      esp_task_wdt_delete(current_task);
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+    return false;
   }
   
   bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0) {
     ESP_LOGE(TAG, "Erreur de réception après PASV");
-    goto error;
+    // Nettoyer les ressources
+    if (buffer) {
+      heap_caps_free(buffer);
+    }
+    if (sock_ != -1) {
+      send(sock_, "QUIT\r\n", 6, 0);
+      ::close(sock_);
+      sock_ = -1;
+    }
+    if (wdt_initialized) {
+      esp_task_wdt_delete(current_task);
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+    return false;
   }
   
   buffer[bytes_received] = '\0';
   if (!strstr(buffer, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif: %s", buffer);
-    goto error;
+    // Nettoyer les ressources
+    if (buffer) {
+      heap_caps_free(buffer);
+    }
+    if (sock_ != -1) {
+      send(sock_, "QUIT\r\n", 6, 0);
+      ::close(sock_);
+      sock_ = -1;
+    }
+    if (wdt_initialized) {
+      esp_task_wdt_delete(current_task);
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+    return false;
   }
   
   ESP_LOGD(TAG, "Réponse PASV: %s", buffer);
@@ -253,13 +300,39 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   pasv_start = strchr(buffer, '(');
   if (!pasv_start) {
     ESP_LOGE(TAG, "Format PASV incorrect");
-    goto error;
+    // Nettoyer les ressources
+    if (buffer) {
+      heap_caps_free(buffer);
+    }
+    if (sock_ != -1) {
+      send(sock_, "QUIT\r\n", 6, 0);
+      ::close(sock_);
+      sock_ = -1;
+    }
+    if (wdt_initialized) {
+      esp_task_wdt_delete(current_task);
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+    return false;
   }
   
   if (sscanf(pasv_start, "(%d,%d,%d,%d,%d,%d)", 
              &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]) != 6) {
     ESP_LOGE(TAG, "Format de réponse PASV invalide");
-    goto error;
+    // Nettoyer les ressources
+    if (buffer) {
+      heap_caps_free(buffer);
+    }
+    if (sock_ != -1) {
+      send(sock_, "QUIT\r\n", 6, 0);
+      ::close(sock_);
+      sock_ = -1;
+    }
+    if (wdt_initialized) {
+      esp_task_wdt_delete(current_task);
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+    return false;
   }
   
   data_port = port[0] * 256 + port[1];
@@ -271,7 +344,20 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   data_sock = ::socket(AF_INET, SOCK_STREAM, 0);
   if (data_sock < 0) {
     ESP_LOGE(TAG, "Échec de création du socket de données");
-    goto error;
+    // Nettoyer les ressources
+    if (buffer) {
+      heap_caps_free(buffer);
+    }
+    if (sock_ != -1) {
+      send(sock_, "QUIT\r\n", 6, 0);
+      ::close(sock_);
+      sock_ = -1;
+    }
+    if (wdt_initialized) {
+      esp_task_wdt_delete(current_task);
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+    return false;
   }
 
   // Options de socket importantes pour le streaming
@@ -298,7 +384,23 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   if (::connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
     if (errno != EINPROGRESS) {
       ESP_LOGE(TAG, "Échec de connexion au port de données");
-      goto error;
+      // Nettoyer les ressources
+      if (buffer) {
+        heap_caps_free(buffer);
+      }
+      if (data_sock != -1) {
+        ::close(data_sock);
+      }
+      if (sock_ != -1) {
+        send(sock_, "QUIT\r\n", 6, 0);
+        ::close(sock_);
+        sock_ = -1;
+      }
+      if (wdt_initialized) {
+        esp_task_wdt_delete(current_task);
+      }
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+      return false;
     }
     
     // Attendre que la connexion s'établisse (mode non-bloquant)
@@ -315,7 +417,23 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     select_res = ::select(data_sock + 1, &read_set, &write_set, NULL, &timeout);
     if (select_res <= 0) {
       ESP_LOGE(TAG, "Timeout lors de la connexion au port de données");
-      goto error;
+      // Nettoyer les ressources
+      if (buffer) {
+        heap_caps_free(buffer);
+      }
+      if (data_sock != -1) {
+        ::close(data_sock);
+      }
+      if (sock_ != -1) {
+        send(sock_, "QUIT\r\n", 6, 0);
+        ::close(sock_);
+        sock_ = -1;
+      }
+      if (wdt_initialized) {
+        esp_task_wdt_delete(current_task);
+      }
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+      return false;
     }
     
     // Vérifier si la connexion a réussi
@@ -323,7 +441,23 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     socklen_t error_code_size = sizeof(error_code);
     if (getsockopt(data_sock, SOL_SOCKET, SO_ERROR, &error_code, &error_code_size) < 0 || error_code != 0) {
       ESP_LOGE(TAG, "Erreur lors de la connexion au port de données: %d", error_code);
-      goto error;
+      // Nettoyer les ressources
+      if (buffer) {
+        heap_caps_free(buffer);
+      }
+      if (data_sock != -1) {
+        ::close(data_sock);
+      }
+      if (sock_ != -1) {
+        send(sock_, "QUIT\r\n", 6, 0);
+        ::close(sock_);
+        sock_ = -1;
+      }
+      if (wdt_initialized) {
+        esp_task_wdt_delete(current_task);
+      }
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+      return false;
     }
   }
 
@@ -334,25 +468,73 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   // Attendre la réponse avec un timeout
   FD_ZERO(&read_set);
   FD_SET(sock_, &read_set);
-  timeout.tv_sec = a5;  // 5 secondes de timeout
+  timeout.tv_sec = 5;  // 5 secondes de timeout
   timeout.tv_usec = 0;
   select_res = ::select(sock_ + 1, &read_set, NULL, NULL, &timeout);
   
   if (select_res <= 0) {
     ESP_LOGE(TAG, "Timeout ou erreur en attente de réponse RETR");
-    goto error;
+    // Nettoyer les ressources
+    if (buffer) {
+      heap_caps_free(buffer);
+    }
+    if (data_sock != -1) {
+      ::close(data_sock);
+    }
+    if (sock_ != -1) {
+      send(sock_, "QUIT\r\n", 6, 0);
+      ::close(sock_);
+      sock_ = -1;
+    }
+    if (wdt_initialized) {
+      esp_task_wdt_delete(current_task);
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+    return false;
   }
   
   bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0) {
     ESP_LOGE(TAG, "Erreur de réception après RETR");
-    goto error;
+    // Nettoyer les ressources
+    if (buffer) {
+      heap_caps_free(buffer);
+    }
+    if (data_sock != -1) {
+      ::close(data_sock);
+    }
+    if (sock_ != -1) {
+      send(sock_, "QUIT\r\n", 6, 0);
+      ::close(sock_);
+      sock_ = -1;
+    }
+    if (wdt_initialized) {
+      esp_task_wdt_delete(current_task);
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+    return false;
   }
   
   buffer[bytes_received] = '\0';
   if (!strstr(buffer, "150 ")) {
     ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible: %s", buffer);
-    goto error;
+    // Nettoyer les ressources
+    if (buffer) {
+      heap_caps_free(buffer);
+    }
+    if (data_sock != -1) {
+      ::close(data_sock);
+    }
+    if (sock_ != -1) {
+      send(sock_, "QUIT\r\n", 6, 0);
+      ::close(sock_);
+      sock_ = -1;
+    }
+    if (wdt_initialized) {
+      esp_task_wdt_delete(current_task);
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
+    return false;
   }
 
   ESP_LOGI(TAG, "Début du transfert de %s", remote_path.c_str());
@@ -380,7 +562,8 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
         continue;
       }
       ESP_LOGE(TAG, "Erreur de select: %d", errno);
-      goto error;
+      // Nettoyer les ressources mais ne pas quitter la fonction, passer à cleanup
+      break;
     } else if (select_res == 0) {
       // Timeout, réinitialiser le watchdog et continuer
       if (wdt_initialized) esp_task_wdt_reset();
@@ -397,7 +580,8 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
         continue;
       } else {
         ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
-        goto error;
+        // Sortir de la boucle et aller à cleanup
+        break;
       }
     } else if (bytes_received == 0) {
       // Fin du transfert
@@ -408,14 +592,16 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     // Envoyer le chunk au client HTTP
     esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
     if (err != ESP_OK) {
-      if (err == ESP_ERR_HTTPD_RESP_SEND || err == ESP_ERR_HTTPD_SOCK_ERR) {
+      // FIXED: ESP_ERR_HTTPD_SOCK_ERR not defined, using only ESP_ERR_HTTPD_RESP_SEND
+      if (err == ESP_ERR_HTTPD_RESP_SEND) {
         ESP_LOGW(TAG, "Client HTTP déconnecté, arrêt du transfert");
         // Ne pas traiter cela comme une erreur fatale, juste terminer proprement
-        goto cleanup;
+        goto cleanup; // This is okay because cleanup is defined BEFORE final_err
       }
       
       ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
-      goto error;
+      // Sortir de la boucle et aller à cleanup
+      break;
     }
     
     // Comptez les chunks pour les fichiers média pour surveiller la progression
@@ -459,10 +645,8 @@ cleanup:
   }
 
   // Envoyer QUIT au serveur FTP
-  send(sock_, "QUIT\r\n", 6, 0);
-  
-  // Fermer le socket de contrôle FTP
   if (sock_ != -1) {
+    send(sock_, "QUIT\r\n", 6, 0);
     ::close(sock_);
     sock_ = -1;
   }
@@ -486,35 +670,8 @@ cleanup:
   }
   
   return success;
-
-error:
-  // Libérer toutes les ressources en cas d'erreur
-  if (buffer) {
-    heap_caps_free(buffer);
-    buffer = NULL;
-  }
-  
-  if (data_sock != -1) {
-    ::close(data_sock);
-    data_sock = -1;
-  }
-  
-  if (sock_ != -1) {
-    send(sock_, "QUIT\r\n", 6, 0);
-    ::close(sock_);
-    sock_ = -1;
-  }
-  
-  // Envoyer un message d'erreur au client HTTP si la connexion est encore active
-  httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
-  
-  // Retirer la tâche du watchdog en cas d'erreur
-  if (wdt_initialized) {
-    esp_task_wdt_delete(current_task);
-  }
-  
-  return false;
 }
+
 esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
   std::string requested_path = req->uri;
@@ -569,21 +726,6 @@ esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Fichier non trouvé");
   return ESP_FAIL;
 }
-
-esp_err_t FTPHTTPProxy::list_files_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
-  if (!proxy->connect_to_ftp()) {
-    ESP_LOGE(TAG, "Échec de connexion FTP");
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de connexion FTP");
-    return ESP_FAIL;
-  }
-
-  // Allouer le JSON en SPIRAM
-  char* json_buffer = (char*)heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
-  if (!json_buffer) {
-    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le JSON");
-    return ESP_FAIL;
-  }
 
   // Simulez une liste de fichiers distants (remplacez par une vraie implémentation)
   std::vector<std::string> files = {"file1.txt", "image.jpg", "audio.mp3"};
