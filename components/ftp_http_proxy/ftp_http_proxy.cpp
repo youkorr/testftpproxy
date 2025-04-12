@@ -125,11 +125,22 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
   bool wdt_initialized = false;
   
+  // Augmenter le timeout du watchdog pour cette tâche spécifique
+  const uint32_t WDT_TIMEOUT_SECONDS = 60; // Augmenter à 30 secondes au lieu de la valeur par défaut de 5s
+  esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = WDT_TIMEOUT_SECONDS * 60000,
+      .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+      .trigger_panic = false  // Désactiver le redémarrage automatique
+  };
+  
+  // Initialiser ou reconfigurer le watchdog avec un timeout plus long
+  esp_task_wdt_init(&wdt_config);
+  
   // Essayer d'ajouter la tâche au WDT si elle n'y est pas déjà
   if (esp_task_wdt_status(current_task) != ESP_OK) {
     if (esp_task_wdt_add(current_task) == ESP_OK) {
       wdt_initialized = true;
-      ESP_LOGI(TAG, "Tâche ajoutée au watchdog");
+      ESP_LOGI(TAG, "Tâche ajoutée au watchdog avec timeout de %d secondes", WDT_TIMEOUT_SECONDS);
     } else {
       ESP_LOGW(TAG, "Impossible d'ajouter la tâche au watchdog");
     }
@@ -149,7 +160,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
                         extension == ".wav" || extension == ".ogg");
 
   // Réduire encore plus la taille du buffer pour les fichiers média
-  int buffer_size = is_media_file ? 8192 : 16384;
+  int buffer_size = is_media_file ? 4096 : 16384; // Buffer plus petit pour les médias
   
   // Allouer le buffer en SPIRAM
   char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
@@ -217,6 +228,10 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   setsockopt(data_sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
   setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
+  // Configurer le socket en mode non-bloquant
+  int socket_flags = fcntl(data_sock, F_GETFL, 0);
+  fcntl(data_sock, F_SETFL, socket_flags | O_NONBLOCK);
+
   struct sockaddr_in data_addr;
   memset(&data_addr, 0, sizeof(data_addr));
   data_addr.sin_family = AF_INET;
@@ -227,8 +242,10 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   if (wdt_initialized) esp_task_wdt_reset();
 
   if (::connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
-    ESP_LOGE(TAG, "Échec de connexion au port de données");
-    goto error;
+    if (errno != EINPROGRESS) {
+      ESP_LOGE(TAG, "Échec de connexion au port de données");
+      goto error;
+    }
   }
 
   snprintf(buffer, buffer_size, "RETR %s\r\n", remote_path.c_str());
@@ -243,14 +260,38 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
 
   // Pour les fichiers média, envoyer en plus petits chunks avec plus de yields
   while (true) {
-    // Réinitialiser le watchdog avant chaque itération pour les fichiers média
-    if (is_media_file && (chunk_count % 5 == 0) && wdt_initialized) {
+    // Réinitialiser le watchdog à intervalles réguliers
+    if ((chunk_count % 3 == 0) && wdt_initialized) {
       esp_task_wdt_reset();
+    }
+    
+    // Utiliser un timeout plus court pour recv() pour éviter de bloquer trop longtemps
+    fd_set read_set;
+    FD_ZERO(&read_set);
+    FD_SET(data_sock, &read_set);
+    
+    struct timeval timeout;
+    timeout.tv_sec = 1;  // 1 seconde de timeout
+    timeout.tv_usec = 0;
+    
+    int select_result = select(data_sock + 1, &read_set, NULL, NULL, &timeout);
+    
+    if (select_result == -1) {
+      ESP_LOGE(TAG, "Erreur de select: %d", errno);
+      goto error;
+    } else if (select_result == 0) {
+      // Timeout, réinitialiser le watchdog et continuer
+      if (wdt_initialized) esp_task_wdt_reset();
+      continue;
     }
     
     bytes_received = recv(data_sock, buffer, buffer_size, 0);
     if (bytes_received <= 0) {
-      if (bytes_received < 0) {
+      if (bytes_received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        // Pas de données disponibles maintenant, yield et réessayer
+        vTaskDelay(pdMS_TO_TICKS(5));
+        continue;
+      } else if (bytes_received < 0) {
         ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
       }
       break;
@@ -264,17 +305,12 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     
     // Comptez les chunks pour les fichiers média pour surveiller la progression
     chunk_count++;
-    if (is_media_file && (chunk_count % 100 == 0)) {
+    if (is_media_file && (chunk_count % 50 == 0)) {
       ESP_LOGD(TAG, "Streaming média: %d chunks envoyés", chunk_count);
     }
     
-    // Yield plus souvent pour les fichiers média
-    if (is_media_file) {
-      // Yield plus souvent pour les fichiers média
-      vTaskDelay(pdMS_TO_TICKS(10));  // Augmenté à 10ms
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(1));
-    }
+    // Yield plus souvent pour laisser d'autres tâches s'exécuter
+    vTaskDelay(pdMS_TO_TICKS(is_media_file ? 5 : 1));
   }
 
   // Réinitialiser le watchdog après la boucle principale
@@ -322,7 +358,6 @@ error:
   
   return false;
 }
-
 
 esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
