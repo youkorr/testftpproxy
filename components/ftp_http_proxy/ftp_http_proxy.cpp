@@ -242,6 +242,8 @@ bool FTPHTTPProxy::download_file_with_range(const std::string &remote_path, http
     int data_port = 0;
     int ip[4], port[2];
     int bytes_received;
+    char *buffer = nullptr; // Déclarer le buffer ici
+    long current = 0;       // Initialiser la variable "current" ici
 
     TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
     bool wdt_initialized = false;
@@ -259,11 +261,10 @@ bool FTPHTTPProxy::download_file_with_range(const std::string &remote_path, http
     }
 
     int buffer_size = 2048;
-    char *buffer = (char *)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
+    buffer = (char *)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
     if (!buffer) {
         ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
-        if (wdt_initialized) esp_task_wdt_delete(current_task);
-        return false;
+        goto error;
     }
 
     if (!connect_to_ftp()) {
@@ -307,9 +308,10 @@ bool FTPHTTPProxy::download_file_with_range(const std::string &remote_path, http
     snprintf(buffer, buffer_size, "RETR %s\r\n", remote_path.c_str());
     send(sock_, buffer, strlen(buffer), 0);
 
+    // Positionner le curseur du fichier au début de la plage demandée
     lseek(data_sock, start, SEEK_SET);
 
-    long current = start;
+    current = start; // Initialiser "current" ici
     while (current <= end) {
         int bytes_to_send = std::min(static_cast<long>(buffer_size), end - current + 1);
         bytes_received = recv(data_sock, buffer, bytes_to_send, 0);
@@ -344,10 +346,10 @@ esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
         requested_path.erase(0, 1);
     }
 
-    const char *range_header = httpd_req_get_hdr_value_str(req, "Range");
-    if (range_header) {
+    char range_buffer[100]; // Buffer pour stocker la valeur de l'en-tête Range
+    if (httpd_req_get_hdr_value_str(req, "Range", range_buffer, sizeof(range_buffer)) == ESP_OK) {
         long start = 0, end = 0;
-        sscanf(range_header, "bytes=%ld-%ld", &start, &end);
+        sscanf(range_buffer, "bytes=%ld-%ld", &start, &end);
 
         struct stat file_stat;
         if (stat(requested_path.c_str(), &file_stat) != 0) {
