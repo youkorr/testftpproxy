@@ -51,11 +51,11 @@ void SdMmc::dump_config() {
   }
 
   if (!this->is_failed()) {
-    const char *freq_unit = card->real_freq_khz < 1000 ? "kHz" : "MHz";
-    const float freq = card->real_freq_khz < 1000 ? card->real_freq_khz : card->real_freq_khz / 1000.0;
-    const char *max_freq_unit = card->max_freq_khz < 1000 ? "kHz" : "MHz";
-    const float max_freq = card->max_freq_khz < 1000 ? card->max_freq_khz : card->max_freq_khz / 1000.0;
-    ESP_LOGCONFIG(TAG, "  Card Speed:  %.2f %s (limit: %.2f %s)%s", freq, freq_unit, max_freq, max_freq_unit, card->is_ddr ? ", DDR" : "");
+    const char *freq_unit = card_->real_freq_khz < 1000 ? "kHz" : "MHz";
+    const float freq = card_->real_freq_khz < 1000 ? card_->real_freq_khz : card_->real_freq_khz / 1000.0;
+    const char *max_freq_unit = card_->max_freq_khz < 1000 ? "kHz" : "MHz";
+    const float max_freq = card_->max_freq_khz < 1000 ? card_->max_freq_khz : card_->max_freq_khz / 1000.0;
+    ESP_LOGCONFIG(TAG, "  Card Speed:  %.2f %s (limit: %.2f %s)%s", freq, freq_unit, max_freq, max_freq_unit, card_->is_ddr ? ", DDR" : "");
   }
 
 #ifdef USE_SENSOR
