@@ -118,10 +118,13 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   char *pasv_start = nullptr;
   int data_port = 0;
   int ip[4], port[2];
-  int bytes_received;
+  int bytes_received = 0;
   int flag = 1;
   int rcvbuf = 65536;
   int chunk_count = 0;
+  int current = 0;
+  int next = 0;
+  char* buffer[2] = {nullptr, nullptr};
 
   TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
   bool wdt_initialized = false;
@@ -146,10 +149,8 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   bool is_media_file = (extension == ".mp3" || extension == ".mp4" || extension == ".wav" || extension == ".ogg");
   int buffer_size = is_media_file ? 4096 : 16384;
 
-  char* buffer[2] = {
-    (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA),
-    (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA)
-  };
+  buffer[0] = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+  buffer[1] = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
   if (!buffer[0] || !buffer[1]) {
     ESP_LOGE(TAG, "Échec d'allocation double buffer");
     goto error;
@@ -220,13 +221,13 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     goto error;
   }
 
-  // ✅ Double buffer en streaming
-  int current = 0;
+  // ✅ Double buffering
+  current = 0;
   bytes_received = recv(data_sock, buffer[current], buffer_size, 0);
 
   while (bytes_received > 0) {
-    int next = 1 - current;
-    int next_bytes = recv(data_sock, buffer[next], buffer_size, 0);  // lire pendant l'envoi
+    next = 1 - current;
+    int next_bytes = recv(data_sock, buffer[next], buffer_size, 0);  // lecture asynchrone
 
     esp_err_t err = httpd_resp_send_chunk(req, buffer[current], bytes_received);
     if (err != ESP_OK) {
@@ -240,7 +241,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     if (wdt_initialized && (++chunk_count % 10 == 0)) esp_task_wdt_reset();
     if (is_media_file && (chunk_count % 100 == 0)) {
       ESP_LOGD(TAG, "Streaming média: %d chunks envoyés", chunk_count);
-      taskYIELD();  // meilleure fluidité que vTaskDelay(20)
+      taskYIELD();
     }
   }
 
@@ -260,8 +261,8 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   ::close(sock_);
   sock_ = -1;
 
-  heap_caps_free(buffer[0]);
-  heap_caps_free(buffer[1]);
+  if (buffer[0]) heap_caps_free(buffer[0]);
+  if (buffer[1]) heap_caps_free(buffer[1]);
   httpd_resp_send_chunk(req, NULL, 0);
 
   if (wdt_initialized) esp_task_wdt_delete(current_task);
