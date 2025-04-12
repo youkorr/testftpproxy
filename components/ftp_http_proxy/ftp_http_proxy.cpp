@@ -572,10 +572,6 @@ esp_err_t FTPHTTPProxy::static_http_req_handler(httpd_req_t *req) {
   return ((FTPHTTPProxy *)req->user_ctx)->http_req_handler(req);
 }
 
-esp_err_t FTPHTTPProxy::static_list_files_handler(httpd_req_t *req) {
-  return ((FTPHTTPProxy *)req->user_ctx)->list_files_handler(req);
-}
-
 esp_err_t FTPHTTPProxy::static_delete_file_handler(httpd_req_t *req) {
   return ((FTPHTTPProxy *)req->user_ctx)->delete_file_handler(req);
 }
