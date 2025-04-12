@@ -119,23 +119,10 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   int ip[4], port[2];
   int bytes_received;
   int flag = 1;
-  int rcvbuf = 32768;
+  int rcvbuf = 32768;  // Augmenté pour SPIRAM
 
-  // Détecter si c'est un fichier média
-  std::string extension = "";
-  size_t dot_pos = remote_path.find_last_of('.');
-  if (dot_pos != std::string::npos) {
-    extension = remote_path.substr(dot_pos);
-  }
-
-  bool is_media_file = (extension == ".mp3" || extension == ".mp4" || 
-                        extension == ".wav" || extension == ".ogg");
-
-  // Réduire la taille du buffer pour les fichiers média pour un streaming plus fluide
-  int buffer_size = is_media_file ? 4096 : 8192;
-  
   // Allouer le buffer en SPIRAM
-  char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
+  char* buffer = (char*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
   if (!buffer) {
     ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
     return false;
@@ -146,25 +133,65 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     goto error;
   }
 
-  // Configuration spéciale pour les fichiers média
-  if (is_media_file) {
-    // Configuration correcte du type MIME
-    if (extension == ".mp3") {
-      httpd_resp_set_type(req, "audio/mpeg");
-    } else if (extension == ".wav") {
-      httpd_resp_set_type(req, "audio/wav");
-    } else if (extension == ".ogg") {
-      httpd_resp_set_type(req, "audio/ogg");
-    } else if (extension == ".mp4") {
-      httpd_resp_set_type(req, "video/mp4");
-    }
-    // Permet la mise en mémoire tampon côté client
+  // Déterminer le type de fichier
+  std::string extension = "";
+  size_t dot_pos = remote_path.find_last_of('.');
+  if (dot_pos != std::string::npos) {
+    extension = remote_path.substr(dot_pos);
+  }
+
+  // Pour les fichiers multimédias, mettre en place une approche de streaming
+  bool is_streaming_media = (extension == ".mp3" || extension == ".mp4" || extension == ".wav" || extension == ".ogg");
+  
+  if (is_streaming_media) {
+    httpd_resp_set_type(req, "audio/mpeg");
     httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
+    
+    // Vérifiez l'en-tête Range (prend en charge la reprise et la recherche)
+    char range_header[50] = {0};
+    int file_size = 0;
+    long range_start = 0, range_end = 0;
+    bool is_range_request = false;
+    
+    // Obtenir la taille totale du fichier via FTP
+    send(sock_, "SIZE ", 5, 0);
+    send(sock_, remote_path.c_str(), remote_path.length(), 0);
+    send(sock_, "\r\n", 2, 0);
+    
+    bytes_received = recv(sock_, buffer, 8191, 0);
+    if (bytes_received > 0 && strstr(buffer, "213 ")) {
+      buffer[bytes_received] = '\0';
+      sscanf(buffer, "213 %d", &file_size);
+      httpd_resp_set_hdr(req, "Content-Length", std::to_string(file_size).c_str());
+    }
+    
+    // Vérifiez si c'est une requête de plage
+    if (httpd_req_get_hdr_value_str(req, "Range", range_header, sizeof(range_header) - 1) == ESP_OK) {
+      sscanf(range_header, "bytes=%ld-%ld", &range_start, &range_end);
+      
+      // Si range_end n'est pas spécifié, il va jusqu'à la fin du fichier
+      if (range_end == 0 && file_size > 0) {
+        range_end = file_size - 1;
+      }
+      
+      if (range_start < file_size) {
+        is_range_request = true;
+        // Envoyer le code d'état 206 Partial Content
+        httpd_resp_set_status(req, "206 Partial Content");
+        
+        // Définir Content-Range header
+        std::string content_range = "bytes " + std::to_string(range_start) + "-" + 
+                                   std::to_string(range_end) + "/" + 
+                                   std::to_string(file_size);
+        httpd_resp_set_hdr(req, "Content-Range", content_range.c_str());
+        httpd_resp_set_hdr(req, "Content-Length", std::to_string(range_end - range_start + 1).c_str());
+      }
+    }
   }
 
   // Mode passif
   send(sock_, "PASV\r\n", 6, 0);
-  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
+  bytes_received = recv(sock_, buffer, 8191, 0);
   if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif");
     goto error;
@@ -201,44 +228,65 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     goto error;
   }
 
-  snprintf(buffer, buffer_size, "RETR %s\r\n", remote_path.c_str());
+  // Si c'est une requête de plage, utilisez REST pour positionnement dans le fichier
+  if (is_streaming_media && is_range_request) {
+    snprintf(buffer, 8192, "REST %ld\r\n", range_start);
+    send(sock_, buffer, strlen(buffer), 0);
+    bytes_received = recv(sock_, buffer, 8191, 0);
+    if (bytes_received <= 0 || !strstr(buffer, "350 ")) {
+      ESP_LOGE(TAG, "Échec de positionnement REST");
+      goto error;
+    }
+  }
+
+  snprintf(buffer, 8192, "RETR %s\r\n", remote_path.c_str());
   send(sock_, buffer, strlen(buffer), 0);
 
-  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
+  bytes_received = recv(sock_, buffer, 8191, 0);
   if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
     ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
     goto error;
   }
   buffer[bytes_received] = '\0';
 
-  // Streaming avec des chunks plus petits pour les fichiers média
-  int chunk_count = 0;
+  // Utiliser des chunks plus petits pour le streaming multimédia
+  int chunk_size = is_streaming_media ? 4096 : 8192;
+  long total_sent = 0;
+  long remaining_to_send = is_range_request ? (range_end - range_start + 1) : LONG_MAX;
+
   while (true) {
-    bytes_received = recv(data_sock, buffer, buffer_size, 0);
+    // Pour les requêtes de plage, n'envoyez que la quantité demandée
+    if (is_range_request && total_sent >= remaining_to_send) {
+      break;
+    }
+
+    bytes_received = recv(data_sock, buffer, chunk_size, 0);
     if (bytes_received <= 0) {
       if (bytes_received < 0) {
         ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
       }
       break;
     }
-    
-    esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
+
+    // Pour les requêtes de plage, ajustez la quantité de données à envoyer
+    int bytes_to_send = bytes_received;
+    if (is_range_request && total_sent + bytes_received > remaining_to_send) {
+      bytes_to_send = remaining_to_send - total_sent;
+    }
+
+    esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_to_send);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
       goto error;
     }
     
-    // Comptez les chunks pour les fichiers média pour surveiller la progression
-    if (is_media_file) {
-      chunk_count++;
-      if (chunk_count % 10 == 0) {
-        ESP_LOGD(TAG, "Streaming média: %d chunks envoyés", chunk_count);
-      }
-      
-      // Yield plus souvent pour les fichiers média
+    total_sent += bytes_to_send;
+    
+    // Yield plus fréquemment pour les streaming média
+    if (is_streaming_media) {
       vTaskDelay(pdMS_TO_TICKS(5));
-    } else if (bytes_received >= buffer_size/2) {
-      vTaskDelay(pdMS_TO_TICKS(3));
+    } else if (bytes_received >= 4096) {
+      vTaskDelay(pdMS_TO_TICKS(5));
     } else {
       vTaskDelay(pdMS_TO_TICKS(1));
     }
@@ -250,7 +298,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   ::close(data_sock);
   data_sock = -1;
 
-  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
+  bytes_received = recv(sock_, buffer, 8191, 0);
   if (bytes_received > 0 && strstr(buffer, "226 ")) {
     success = true;
     buffer[bytes_received] = '\0';
