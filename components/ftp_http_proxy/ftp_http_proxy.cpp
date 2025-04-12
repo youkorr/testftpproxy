@@ -130,7 +130,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   }
 
   bool is_media_file = (extension == ".mp3" || extension == ".mp4" || 
-                        extension == ".wav" || extension == ".ogg");
+                        extension == ".avi" ||extension == ".wav" || extension == ".ogg");
 
   // Réduire la taille du buffer pour les fichiers média pour un streaming plus fluide
   int buffer_size = is_media_file ? 4096 : 8192;
@@ -158,6 +158,8 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
       httpd_resp_set_type(req, "audio/ogg");
     } else if (extension == ".mp4") {
       httpd_resp_set_type(req, "video/mp4");
+    } else if (extension == ".avi") {
+      httpd_resp_set_type(req, "video/avi");  
     }
     // Permet la mise en mémoire tampon côté client
     httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
