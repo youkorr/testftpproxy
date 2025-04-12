@@ -150,7 +150,8 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
                         extension == ".wav" || extension == ".ogg");
 
   // Réduire encore plus la taille du buffer pour les fichiers média
-  int buffer_size = is_media_file ? 2048 : 8192;
+  // Buffer plus petit pour permettre des reset WDT plus fréquents
+  int buffer_size = is_media_file ? 1024 : 8192;
   
   // Allouer le buffer en SPIRAM
   char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
@@ -182,6 +183,20 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     }
     // Permet la mise en mémoire tampon côté client
     httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
+    
+    // Configuration spécifique pour les fichiers média pour éviter le timeout WDT
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    
+    // Augmenter le timeout du watchdog pour les fichiers média si possible
+    esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = 10000,  // 10 secondes au lieu du défaut
+      .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+      .trigger_panic = true
+    };
+    if (esp_task_wdt_reconfigure(&wdt_config) != ESP_OK) {
+      ESP_LOGW(TAG, "Impossible de reconfigurer le watchdog");
+    }
   }
 
   // Réinitialiser le watchdog avant des opérations de communication
@@ -243,10 +258,18 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   buffer[bytes_received] = '\0';
 
   // Pour les fichiers média, envoyer en plus petits chunks avec plus de yields
+  uint32_t last_wdt_reset = esp_timer_get_time() / 1000;
+  uint32_t current_time;
+  
   while (true) {
-    // Réinitialiser le watchdog avant chaque itération pour les fichiers média
-    if (is_media_file && (chunk_count % 5 == 0) && wdt_initialized) {
-      esp_task_wdt_reset();
+    // Réinitialiser le watchdog plus souvent, toutes les 500ms maximum
+    current_time = esp_timer_get_time() / 1000;
+    if (current_time - last_wdt_reset >= 500) {  // 500ms
+      if (wdt_initialized) {
+        esp_task_wdt_reset();
+        last_wdt_reset = current_time;
+        ESP_LOGD(TAG, "WDT reset à %d chunks", chunk_count);
+      }
     }
     
     bytes_received = recv(data_sock, buffer, buffer_size, 0);
@@ -272,7 +295,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     // Yield plus souvent pour les fichiers média
     if (is_media_file) {
       // Yield plus souvent pour les fichiers média
-      vTaskDelay(pdMS_TO_TICKS(10));  // Augmenté à 10ms
+      vTaskDelay(pdMS_TO_TICKS(20));  // Augmenté à 20ms
     } else {
       vTaskDelay(pdMS_TO_TICKS(1));
     }
@@ -323,7 +346,6 @@ error:
   
   return false;
 }
-
 
 esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
