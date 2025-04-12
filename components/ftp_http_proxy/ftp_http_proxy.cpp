@@ -111,7 +111,6 @@ bool FTPHTTPProxy::connect_to_ftp() {
   return true;
 }
 
-
 bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *req) {
   int data_sock = -1;
   bool success = false;
@@ -122,9 +121,6 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   int flag = 1;
   int rcvbuf = 32768;
   int chunk_count = 0;
-  // Variables pour le suivi du temps pour le WDT
-  uint32_t last_wdt_reset = 0;
-  uint32_t current_time = 0;
   
   // Obtenir le handle de la tâche actuelle pour le watchdog
   TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
@@ -154,9 +150,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
                         extension == ".wav" || extension == ".ogg");
 
   // Réduire encore plus la taille du buffer pour les fichiers média
-  // Buffer plus petit pour permettre des reset WDT plus fréquents
-  // Plus petit buffer pour les fichiers média (512 octets au lieu de 1024)
-  int buffer_size = is_media_file ? 512 : 4096;
+  int buffer_size = is_media_file ? 4096 : 16384;
   
   // Allouer le buffer en SPIRAM
   char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
@@ -166,17 +160,12 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     return false;
   }
 
-  // Initialiser le timer pour le WDT
-  last_wdt_reset = xTaskGetTickCount() * portTICK_PERIOD_MS;
-  
   // Réinitialiser le watchdog avant des opérations potentiellement longues
   if (wdt_initialized) esp_task_wdt_reset();
 
   if (!connect_to_ftp()) {
     ESP_LOGE(TAG, "Échec de connexion FTP");
-    heap_caps_free(buffer);
-    if (wdt_initialized) esp_task_wdt_delete(current_task);
-    return false;
+    goto error;
   }
 
   // Configuration spéciale pour les fichiers média
@@ -193,23 +182,6 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     }
     // Permet la mise en mémoire tampon côté client
     httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
-    
-    // Configuration spécifique pour les fichiers média pour éviter le timeout WDT
-    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    
-    // Augmenter le timeout du watchdog pour les fichiers média si possible
-    esp_task_wdt_config_t wdt_config = {
-      .timeout_ms = 10000,  // 10 secondes au lieu du défaut
-      .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
-      .trigger_panic = true
-    };
-    esp_err_t wdt_result = esp_task_wdt_reconfigure(&wdt_config);
-    if (wdt_result != ESP_OK) {
-      ESP_LOGW(TAG, "Impossible de reconfigurer le watchdog: %d", wdt_result);
-    } else {
-      ESP_LOGI(TAG, "Watchdog reconfiguré avec succès pour fichier média");
-    }
   }
 
   // Réinitialiser le watchdog avant des opérations de communication
@@ -220,9 +192,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif");
-    heap_caps_free(buffer);
-    if (wdt_initialized) esp_task_wdt_delete(current_task);
-    return false;
+    goto error;
   }
   buffer[bytes_received] = '\0';
   ESP_LOGD(TAG, "Réponse PASV: %s", buffer);
@@ -230,9 +200,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   pasv_start = strchr(buffer, '(');
   if (!pasv_start) {
     ESP_LOGE(TAG, "Format PASV incorrect");
-    heap_caps_free(buffer);
-    if (wdt_initialized) esp_task_wdt_delete(current_task);
-    return false;
+    goto error;
   }
   sscanf(pasv_start, "(%d,%d,%d,%d,%d,%d)", &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]);
   data_port = port[0] * 256 + port[1];
@@ -244,9 +212,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   data_sock = ::socket(AF_INET, SOCK_STREAM, 0);
   if (data_sock < 0) {
     ESP_LOGE(TAG, "Échec de création du socket de données");
-    heap_caps_free(buffer);
-    if (wdt_initialized) esp_task_wdt_delete(current_task);
-    return false;
+    goto error;
   }
 
   setsockopt(data_sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
@@ -263,10 +229,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
 
   if (::connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
     ESP_LOGE(TAG, "Échec de connexion au port de données");
-    ::close(data_sock);
-    heap_caps_free(buffer);
-    if (wdt_initialized) esp_task_wdt_delete(current_task);
-    return false;
+    goto error;
   }
 
   snprintf(buffer, buffer_size, "RETR %s\r\n", remote_path.c_str());
@@ -275,47 +238,91 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
     ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
-    ::close(data_sock);
-    heap_caps_free(buffer);
-    if (wdt_initialized) esp_task_wdt_delete(current_task);
-    return false;
+    goto error;
   }
   buffer[bytes_received] = '\0';
 
   // Pour les fichiers média, envoyer en plus petits chunks avec plus de yields
-  int consecutive_chunks = 0;
-  const int yield_interval = is_media_file ? 5 : 50;  // Yield plus fréquemment pour les médias
-  const int wdt_reset_interval = is_media_file ? 100 : 250;  // Réduire l'intervalle de reset WDT (ms)
-  
-  // Pour les très grands fichiers, informer le client qu'on traite la requête
-  if (is_media_file) {
-    ESP_LOGI(TAG, "Début du streaming du fichier média %s", remote_path.c_str());
-  }
-  
   while (true) {
-    // Réinitialiser le watchdog plus souvent pour éviter les timeouts
-    current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    if (current_time - last_wdt_reset >= wdt_reset_interval) {
-      if (wdt_initialized) {
-        esp_task_wdt_reset();
-        last_wdt_reset = current_time;
-        // Log moins fréquent pour éviter de surcharger les logs
-        if (chunk_count % 100 == 0) {
-          ESP_LOGD(TAG, "WDT reset à %d chunks", chunk_count);
-        }
-      }
+    // Réinitialiser le watchdog avant chaque itération pour les fichiers média
+    if (is_media_file && (chunk_count % 5 == 0) && wdt_initialized) {
+      esp_task_wdt_reset();
     }
     
-    // Réduire la taille de lecture pour des fichiers média pour éviter les blocages
-    int read_size = is_media_file ? buffer_size / 2 : buffer_size;
-    bytes_received = recv(data_sock, buffer, read_size, 0);
-    
+    bytes_received = recv(data_sock, buffer, buffer_size, 0);
     if (bytes_received <= 0) {
       if (bytes_received < 0) {
         ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
       }
       break;
     }
+    
+    esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
+      goto error;
+    }
+    
+    // Comptez les chunks pour les fichiers média pour surveiller la progression
+    chunk_count++;
+    if (is_media_file && (chunk_count % 100 == 0)) {
+      ESP_LOGD(TAG, "Streaming média: %d chunks envoyés", chunk_count);
+    }
+    
+    // Yield plus souvent pour les fichiers média
+    if (is_media_file) {
+      // Yield plus souvent pour les fichiers média
+      vTaskDelay(pdMS_TO_TICKS(10));  // Augmenté à 10ms
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+
+  // Réinitialiser le watchdog après la boucle principale
+  if (wdt_initialized) esp_task_wdt_reset();
+
+  ::close(data_sock);
+  data_sock = -1;
+
+  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
+  if (bytes_received > 0 && strstr(buffer, "226 ")) {
+    success = true;
+    buffer[bytes_received] = '\0';
+    ESP_LOGD(TAG, "Transfert terminé: %s", buffer);
+  }
+
+  send(sock_, "QUIT\r\n", 6, 0);
+  ::close(sock_);
+  sock_ = -1;
+
+  // Libérer le buffer SPIRAM
+  heap_caps_free(buffer);
+  
+  httpd_resp_send_chunk(req, NULL, 0);
+  
+  // Retirer la tâche du watchdog à la fin
+  if (wdt_initialized) {
+    esp_task_wdt_delete(current_task);
+  }
+  
+  return success;
+
+error:
+  if (buffer) heap_caps_free(buffer);
+  if (data_sock != -1) ::close(data_sock);
+  if (sock_ != -1) {
+    send(sock_, "QUIT\r\n", 6, 0);
+    ::close(sock_);
+    sock_ = -1;
+  }
+  
+  // Retirer la tâche du watchdog en cas d'erreur
+  if (wdt_initialized) {
+    esp_task_wdt_delete(current_task);
+  }
+  
+  return false;
+}
     
     esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
     if (err != ESP_OK) {
