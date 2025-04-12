@@ -132,7 +132,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   bool wdt_initialized = false;
   
   // Augmenter le timeout du watchdog pour cette tâche spécifique
-  const uint32_t WDT_TIMEOUT_SECONDS = 30; // Augmenter à 30 secondes au lieu de la valeur par défaut de 5s
+  const uint32_t WDT_TIMEOUT_SECONDS = 5; // Augmenter à 30 secondes au lieu de la valeur par défaut de 5s
   esp_task_wdt_config_t wdt_config;
   wdt_config.timeout_ms = WDT_TIMEOUT_SECONDS * 1000;
   wdt_config.idle_core_mask = (1 << portNUM_PROCESSORS) - 1;
