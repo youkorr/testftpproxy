@@ -53,7 +53,7 @@ bool FTPHTTPProxy::connect_to_ftp() {
   setsockopt(sock_, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
 
   // Augmenter la taille du buffer de réception
-  int rcvbuf = 32768;  // Augmenté car SPIRAM a plus d'espace
+  int rcvbuf = 32768 * 2;  // Double de la taille initiale (65 536 octets
   setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
   struct sockaddr_in server_addr;
