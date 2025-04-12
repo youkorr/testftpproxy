@@ -27,27 +27,13 @@ class FTPHTTPProxy : public Component {
   esp_err_t list_files_handler(httpd_req_t *req);
   esp_err_t delete_file_handler(httpd_req_t *req);
   esp_err_t upload_file_handler(httpd_req_t *req);
+  esp_err_t http_req_handler(httpd_req_t *req);
   
-  // Ajout des wrappers statiques pour les gestionnaires HTTP
-  static esp_err_t static_http_req_handler(httpd_req_t *req) {
-    auto *proxy = static_cast<FTPHTTPProxy *>(req->user_ctx);
-    return proxy->http_req_handler(req);
-  }
-  
-  static esp_err_t static_list_files_handler(httpd_req_t *req) {
-    auto *proxy = static_cast<FTPHTTPProxy *>(req->user_ctx);
-    return proxy->list_files_handler(req);
-  }
-  
-  static esp_err_t static_delete_file_handler(httpd_req_t *req) {
-    auto *proxy = static_cast<FTPHTTPProxy *>(req->user_ctx);
-    return proxy->delete_file_handler(req);
-  }
-  
-  static esp_err_t static_upload_file_handler(httpd_req_t *req) {
-    auto *proxy = static_cast<FTPHTTPProxy *>(req->user_ctx);
-    return proxy->upload_file_handler(req);
-  }
+  // Déclarations des wrappers statiques (sans implémentation)
+  static esp_err_t static_http_req_handler(httpd_req_t *req);
+  static esp_err_t static_list_files_handler(httpd_req_t *req);
+  static esp_err_t static_delete_file_handler(httpd_req_t *req);
+  static esp_err_t static_upload_file_handler(httpd_req_t *req);
   
  protected:
   std::string ftp_server_;
@@ -63,8 +49,8 @@ class FTPHTTPProxy : public Component {
   bool connect_to_ftp();
   bool download_file_impl(const std::string &remote_path, httpd_req_t *req);
   void setup_http_server();
-  static esp_err_t http_req_handler(httpd_req_t *req);
 };
 
 }  // namespace ftp_http_proxy
 }  // namespace esphome
+
