@@ -567,18 +567,7 @@ void FTPHTTPProxy::setup_http_server() {
   ESP_LOGI(TAG, "Serveur HTTP démarré sur le port %d", local_port_);
 }
 
-// Ces méthodes statiques sont uniquement des wrappers pour les méthodes membres
-esp_err_t FTPHTTPProxy::static_http_req_handler(httpd_req_t *req) {
-  return ((FTPHTTPProxy *)req->user_ctx)->http_req_handler(req);
-}
 
-esp_err_t FTPHTTPProxy::static_delete_file_handler(httpd_req_t *req) {
-  return ((FTPHTTPProxy *)req->user_ctx)->delete_file_handler(req);
-}
-
-esp_err_t FTPHTTPProxy::static_upload_file_handler(httpd_req_t *req) {
-  return ((FTPHTTPProxy *)req->user_ctx)->upload_file_handler(req);
-}
 
 }  // namespace ftp_http_proxy
 }  // namespace esphome
