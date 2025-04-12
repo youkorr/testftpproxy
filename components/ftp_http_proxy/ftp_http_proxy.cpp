@@ -121,17 +121,22 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   int rcvbuf = 32768;
   int chunk_count = 0;
   
+  // Déclarations déplacées au début pour éviter les problèmes de goto
+  fd_set read_set;
+  struct timeval timeout;
+  int select_res = 0;
+  int socket_flags = 0;
+  
   // Obtenir le handle de la tâche actuelle pour le watchdog
   TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
   bool wdt_initialized = false;
   
   // Augmenter le timeout du watchdog pour cette tâche spécifique
-  const uint32_t WDT_TIMEOUT_SECONDS = 60; // Augmenter à 30 secondes au lieu de la valeur par défaut de 5s
-  esp_task_wdt_config_t wdt_config = {
-      .timeout_ms = WDT_TIMEOUT_SECONDS * 60000,
-      .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
-      .trigger_panic = false  // Désactiver le redémarrage automatique
-  };
+  const uint32_t WDT_TIMEOUT_SECONDS = 30; // Augmenter à 30 secondes au lieu de la valeur par défaut de 5s
+  esp_task_wdt_config_t wdt_config;
+  wdt_config.timeout_ms = WDT_TIMEOUT_SECONDS * 1000;
+  wdt_config.idle_core_mask = (1 << portNUM_PROCESSORS) - 1;
+  wdt_config.trigger_panic = false;  // Désactiver le redémarrage automatique
   
   // Initialiser ou reconfigurer le watchdog avec un timeout plus long
   esp_task_wdt_init(&wdt_config);
@@ -229,7 +234,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
   // Configurer le socket en mode non-bloquant
-  int socket_flags = fcntl(data_sock, F_GETFL, 0);
+  socket_flags = fcntl(data_sock, F_GETFL, 0);
   fcntl(data_sock, F_SETFL, socket_flags | O_NONBLOCK);
 
   struct sockaddr_in data_addr;
@@ -266,20 +271,19 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     }
     
     // Utiliser un timeout plus court pour recv() pour éviter de bloquer trop longtemps
-    fd_set read_set;
     FD_ZERO(&read_set);
     FD_SET(data_sock, &read_set);
     
-    struct timeval timeout;
     timeout.tv_sec = 1;  // 1 seconde de timeout
     timeout.tv_usec = 0;
     
-    int select_result = select(data_sock + 1, &read_set, NULL, NULL, &timeout);
+    // Utiliser le système select plutôt que la fonction select (pour éviter les conflits de noms)
+    select_res = ::select(data_sock + 1, &read_set, NULL, NULL, &timeout);
     
-    if (select_result == -1) {
+    if (select_res == -1) {
       ESP_LOGE(TAG, "Erreur de select: %d", errno);
       goto error;
-    } else if (select_result == 0) {
+    } else if (select_res == 0) {
       // Timeout, réinitialiser le watchdog et continuer
       if (wdt_initialized) esp_task_wdt_reset();
       continue;
@@ -307,6 +311,11 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     chunk_count++;
     if (is_media_file && (chunk_count % 50 == 0)) {
       ESP_LOGD(TAG, "Streaming média: %d chunks envoyés", chunk_count);
+    }
+    
+    // Réinitialiser le watchdog plus souvent pour les fichiers média
+    if (is_media_file && (chunk_count % 10 == 0) && wdt_initialized) {
+      esp_task_wdt_reset();
     }
     
     // Yield plus souvent pour laisser d'autres tâches s'exécuter
