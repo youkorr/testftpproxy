@@ -119,10 +119,24 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   int ip[4], port[2];
   int bytes_received;
   int flag = 1;
-  int rcvbuf = 32768;  // Augmenté pour SPIRAM
+  int rcvbuf = 32768;
+  int chunk_count = 0;  // Déplacé ici en haut pour éviter le problème de goto
 
+  // Détecter si c'est un fichier média
+  std::string extension = "";
+  size_t dot_pos = remote_path.find_last_of('.');
+  if (dot_pos != std::string::npos) {
+    extension = remote_path.substr(dot_pos);
+  }
+
+  bool is_media_file = (extension == ".mp3" || extension == ".mp4" || 
+                        extension == ".wav" || extension == ".ogg");
+
+  // Réduire la taille du buffer pour les fichiers média pour un streaming plus fluide
+  int buffer_size =  2097152; // 2MB
+  
   // Allouer le buffer en SPIRAM
-  char* buffer = (char*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+  char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
   if (!buffer) {
     ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
     return false;
@@ -133,9 +147,25 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     goto error;
   }
 
+  // Configuration spéciale pour les fichiers média
+  if (is_media_file) {
+    // Configuration correcte du type MIME
+    if (extension == ".mp3") {
+      httpd_resp_set_type(req, "audio/mpeg");
+    } else if (extension == ".wav") {
+      httpd_resp_set_type(req, "audio/wav");
+    } else if (extension == ".ogg") {
+      httpd_resp_set_type(req, "audio/ogg");
+    } else if (extension == ".mp4") {
+      httpd_resp_set_type(req, "video/mp4");
+    }
+    // Permet la mise en mémoire tampon côté client
+    httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
+  }
+
   // Mode passif
   send(sock_, "PASV\r\n", 6, 0);
-  bytes_received = recv(sock_, buffer, 8191, 0);
+  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif");
     goto error;
@@ -172,33 +202,43 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     goto error;
   }
 
-  snprintf(buffer, 8192, "RETR %s\r\n", remote_path.c_str());
+  snprintf(buffer, buffer_size, "RETR %s\r\n", remote_path.c_str());
   send(sock_, buffer, strlen(buffer), 0);
 
-  bytes_received = recv(sock_, buffer, 8191, 0);
+  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
     ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
     goto error;
   }
   buffer[bytes_received] = '\0';
 
+  // Streaming avec des chunks plus petits pour les fichiers média
   while (true) {
-    bytes_received = recv(data_sock, buffer, 8192, 0);
+    bytes_received = recv(data_sock, buffer, buffer_size, 0);
     if (bytes_received <= 0) {
       if (bytes_received < 0) {
         ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
       }
       break;
     }
+    
     esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
       goto error;
     }
     
-    // Yield plus fréquemment, surtout pour les grands transferts
-    if (bytes_received >= 4096) {
+    // Comptez les chunks pour les fichiers média pour surveiller la progression
+    if (is_media_file) {
+      chunk_count++;
+      if (chunk_count % 10 == 0) {
+        ESP_LOGD(TAG, "Streaming média: %d chunks envoyés", chunk_count);
+      }
+      
+      // Yield plus souvent pour les fichiers média
       vTaskDelay(pdMS_TO_TICKS(5));
+    } else if (bytes_received >= buffer_size/2) {
+      vTaskDelay(pdMS_TO_TICKS(3));
     } else {
       vTaskDelay(pdMS_TO_TICKS(1));
     }
@@ -210,7 +250,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   ::close(data_sock);
   data_sock = -1;
 
-  bytes_received = recv(sock_, buffer, 8191, 0);
+  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received > 0 && strstr(buffer, "226 ")) {
     success = true;
     buffer[bytes_received] = '\0';
@@ -236,138 +276,6 @@ error:
     sock_ = -1;
   }
   return false;
-}
-
-esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
-  std::string requested_path = req->uri;
-
-  if (!requested_path.empty() && requested_path[0] == '/') {
-    requested_path.erase(0, 1);
-  }
-
-  ESP_LOGI(TAG, "Requête reçue: %s", requested_path.c_str());
-
-  std::string extension = "";
-  size_t dot_pos = requested_path.find_last_of('.');
-  if (dot_pos != std::string::npos) {
-    extension = requested_path.substr(dot_pos);
-  }
-
-  std::string filename = requested_path;
-  size_t slash_pos = requested_path.find_last_of('/');
-  if (slash_pos != std::string::npos) {
-    filename = requested_path.substr(slash_pos + 1);
-  }
-
-  if (extension == ".mp3" || extension == ".wav" || extension == ".ogg") {
-    httpd_resp_set_type(req, "application/octet-stream");
-    std::string header = "attachment; filename=\"" + filename + "\"";
-    httpd_resp_set_hdr(req, "Content-Disposition", header.c_str());
-  } else if (extension == ".pdf") {
-    httpd_resp_set_type(req, "application/pdf");
-  } else if (extension == ".jpg" || extension == ".jpeg") {
-    httpd_resp_set_type(req, "image/jpeg");
-  } else if (extension == ".png") {
-    httpd_resp_set_type(req, "image/png");
-  } else {
-    httpd_resp_set_type(req, "application/octet-stream");
-    std::string header = "attachment; filename=\"" + filename + "\"";
-    httpd_resp_set_hdr(req, "Content-Disposition", header.c_str());
-  }
-
-  httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
-
-  for (const auto &configured_path : proxy->remote_paths_) {
-    if (requested_path == configured_path) {
-      if (proxy->download_file(configured_path, req)) {
-        return ESP_OK;
-      } else {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec du téléchargement");
-        return ESP_FAIL;
-      }
-    }
-  }
-
-  httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Fichier non trouvé");
-  return ESP_FAIL;
-}
-
-esp_err_t FTPHTTPProxy::list_files_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
-  if (!proxy->connect_to_ftp()) {
-    ESP_LOGE(TAG, "Échec de connexion FTP");
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de connexion FTP");
-    return ESP_FAIL;
-  }
-
-  // Allouer le JSON en SPIRAM
-  char* json_buffer = (char*)heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
-  if (!json_buffer) {
-    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le JSON");
-    return ESP_FAIL;
-  }
-
-  // Simulez une liste de fichiers distants (remplacez par une vraie implémentation)
-  std::vector<std::string> files = {"file1.txt", "image.jpg", "audio.mp3"};
-  strcpy(json_buffer, "[");
-  
-  for (size_t i = 0; i < files.size(); ++i) {
-    strcat(json_buffer, "{\"name\":\"");
-    strcat(json_buffer, files[i].c_str());
-    strcat(json_buffer, "\"}");
-    if (i < files.size() - 1) strcat(json_buffer, ",");
-  }
-  
-  strcat(json_buffer, "]");
-
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_send(req, json_buffer, strlen(json_buffer));
-  
-  // Libérer la mémoire
-  heap_caps_free(json_buffer);
-  
-  return ESP_OK;
-}
-
-esp_err_t FTPHTTPProxy::delete_file_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
-  std::string file_name = req->uri + strlen("/delete/");
-  ESP_LOGI(TAG, "Suppression du fichier: %s", file_name.c_str());
-
-  if (!proxy->connect_to_ftp()) {
-    ESP_LOGE(TAG, "Échec de connexion FTP");
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de connexion FTP");
-    return ESP_FAIL;
-  }
-
-  // Allouer le buffer en SPIRAM
-  char* buffer = (char*)heap_caps_malloc(256, MALLOC_CAP_SPIRAM);
-  if (!buffer) {
-    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
-    return ESP_FAIL;
-  }
-
-  snprintf(buffer, 256, "DELE %s\r\n", file_name.c_str());
-  send(proxy->sock_, buffer, strlen(buffer), 0);
-
-  int bytes_received = recv(proxy->sock_, buffer, 255, 0);
-  buffer[bytes_received] = '\0';
-
-  if (strstr(buffer, "250 ")) {
-    httpd_resp_send(req, "File deleted", HTTPD_RESP_USE_STRLEN);
-  } else {
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de suppression");
-  }
-
-  send(proxy->sock_, "QUIT\r\n", 6, 0);
-  ::close(proxy->sock_);
-  proxy->sock_ = -1;
-
-  // Libérer le buffer
-  heap_caps_free(buffer);
-
-  return ESP_OK;
 }
 
 esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
