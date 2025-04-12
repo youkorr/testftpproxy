@@ -189,6 +189,12 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
       httpd_resp_set_type(req, "audio/ogg");
     } else if (extension == ".mp4") {
       httpd_resp_set_type(req, "video/mp4");
+    } else if (extension == ".avi") {
+      httpd_resp_set_type(req, "video/x-msvideo");
+    } else if (extension == ".jpg") {
+      httpd_resp_set_type(req, "image/jpeg");
+    } else if (extension == ".png") {
+      httpd_resp_set_type(req, "image/png");
     }
     // Permet la mise en mémoire tampon côté client
     httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
