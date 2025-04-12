@@ -6,6 +6,8 @@
 #include <cstring>
 #include <arpa/inet.h>
 #include "esp_task_wdt.h"
+#include "esp_heap_caps.h"
+#include "esp_spiram.h"
 
 static const char *TAG = "ftp_proxy";
 
@@ -14,6 +16,10 @@ namespace ftp_http_proxy {
 
 void FTPHTTPProxy::setup() {
   ESP_LOGI(TAG, "Initialisation du proxy FTP/HTTP");
+
+  // Vérifier que la SPIRAM est disponible et afficher la mémoire disponible
+  size_t spiram_size = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  ESP_LOGI(TAG, "SPIRAM disponible: %d octets", spiram_size);
 
   // Initialize Task Watchdog Timer with new API
   esp_task_wdt_config_t twdt_config = {
@@ -48,7 +54,7 @@ bool FTPHTTPProxy::connect_to_ftp() {
   setsockopt(sock_, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
 
   // Augmenter la taille du buffer de réception
-  int rcvbuf = 16384;
+  int rcvbuf = 32768;  // Augmenté car SPIRAM a plus d'espace
   setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
   struct sockaddr_in server_addr;
@@ -64,10 +70,19 @@ bool FTPHTTPProxy::connect_to_ftp() {
     return false;
   }
 
-  char buffer[256];
-  int bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  // Allouer le buffer en SPIRAM
+  char* buffer = (char*)heap_caps_malloc(256, MALLOC_CAP_SPIRAM);
+  if (!buffer) {
+    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
+    ::close(sock_);
+    sock_ = -1;
+    return false;
+  }
+
+  int bytes_received = recv(sock_, buffer, 255, 0);
   if (bytes_received <= 0 || !strstr(buffer, "220 ")) {
     ESP_LOGE(TAG, "Message de bienvenue FTP non reçu");
+    heap_caps_free(buffer);
     ::close(sock_);
     sock_ = -1;
     return false;
@@ -75,21 +90,24 @@ bool FTPHTTPProxy::connect_to_ftp() {
   buffer[bytes_received] = '\0';
 
   // Authentification
-  snprintf(buffer, sizeof(buffer), "USER %s\r\n", username_.c_str());
+  snprintf(buffer, 256, "USER %s\r\n", username_.c_str());
   send(sock_, buffer, strlen(buffer), 0);
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv(sock_, buffer, 255, 0);
   buffer[bytes_received] = '\0';
 
-  snprintf(buffer, sizeof(buffer), "PASS %s\r\n", password_.c_str());
+  snprintf(buffer, 256, "PASS %s\r\n", password_.c_str());
   send(sock_, buffer, strlen(buffer), 0);
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv(sock_, buffer, 255, 0);
   buffer[bytes_received] = '\0';
 
   // Mode binaire
   send(sock_, "TYPE I\r\n", 8, 0);
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv(sock_, buffer, 255, 0);
   buffer[bytes_received] = '\0';
 
+  // Libérer le buffer
+  heap_caps_free(buffer);
+  
   return true;
 }
 
@@ -99,10 +117,16 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   char *pasv_start = nullptr;
   int data_port = 0;
   int ip[4], port[2];
-  char buffer[8192];
   int bytes_received;
   int flag = 1;
-  int rcvbuf = 16384;
+  int rcvbuf = 32768;  // Augmenté pour SPIRAM
+
+  // Allouer le buffer en SPIRAM
+  char* buffer = (char*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+  if (!buffer) {
+    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
+    return false;
+  }
 
   if (!connect_to_ftp()) {
     ESP_LOGE(TAG, "Échec de connexion FTP");
@@ -111,7 +135,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
 
   // Mode passif
   send(sock_, "PASV\r\n", 6, 0);
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv(sock_, buffer, 8191, 0);
   if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif");
     goto error;
@@ -148,10 +172,10 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     goto error;
   }
 
-  snprintf(buffer, sizeof(buffer), "RETR %s\r\n", remote_path.c_str());
+  snprintf(buffer, 8192, "RETR %s\r\n", remote_path.c_str());
   send(sock_, buffer, strlen(buffer), 0);
 
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv(sock_, buffer, 8191, 0);
   if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
     ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
     goto error;
@@ -159,7 +183,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   buffer[bytes_received] = '\0';
 
   while (true) {
-    bytes_received = recv(data_sock, buffer, sizeof(buffer), 0);
+    bytes_received = recv(data_sock, buffer, 8192, 0);
     if (bytes_received <= 0) {
       if (bytes_received < 0) {
         ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
@@ -172,21 +196,21 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
       goto error;
     }
     
-    // Yield more frequently, especially for large transfers
+    // Yield plus fréquemment, surtout pour les grands transferts
     if (bytes_received >= 4096) {
       vTaskDelay(pdMS_TO_TICKS(5));
     } else {
       vTaskDelay(pdMS_TO_TICKS(1));
     }
     
-    // Reset watchdog timer explicitly
+    // Réinitialiser le watchdog explicitement
     esp_task_wdt_reset();
   }
 
   ::close(data_sock);
   data_sock = -1;
 
-  bytes_received = recv(sock_, buffer, sizeof(buffer) - 1, 0);
+  bytes_received = recv(sock_, buffer, 8191, 0);
   if (bytes_received > 0 && strstr(buffer, "226 ")) {
     success = true;
     buffer[bytes_received] = '\0';
@@ -197,10 +221,14 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   ::close(sock_);
   sock_ = -1;
 
+  // Libérer le buffer SPIRAM
+  heap_caps_free(buffer);
+  
   httpd_resp_send_chunk(req, NULL, 0);
   return success;
 
 error:
+  if (buffer) heap_caps_free(buffer);
   if (data_sock != -1) ::close(data_sock);
   if (sock_ != -1) {
     send(sock_, "QUIT\r\n", 6, 0);
@@ -273,17 +301,32 @@ esp_err_t FTPHTTPProxy::list_files_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
+  // Allouer le JSON en SPIRAM
+  char* json_buffer = (char*)heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+  if (!json_buffer) {
+    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le JSON");
+    return ESP_FAIL;
+  }
+
   // Simulez une liste de fichiers distants (remplacez par une vraie implémentation)
   std::vector<std::string> files = {"file1.txt", "image.jpg", "audio.mp3"};
-  std::string json = "[";
+  strcpy(json_buffer, "[");
+  
   for (size_t i = 0; i < files.size(); ++i) {
-    json += "{\"name\":\"" + files[i] + "\"}";
-    if (i < files.size() - 1) json += ",";
+    strcat(json_buffer, "{\"name\":\"");
+    strcat(json_buffer, files[i].c_str());
+    strcat(json_buffer, "\"}");
+    if (i < files.size() - 1) strcat(json_buffer, ",");
   }
-  json += "]";
+  
+  strcat(json_buffer, "]");
 
   httpd_resp_set_type(req, "application/json");
-  httpd_resp_send(req, json.c_str(), json.length());
+  httpd_resp_send(req, json_buffer, strlen(json_buffer));
+  
+  // Libérer la mémoire
+  heap_caps_free(json_buffer);
+  
   return ESP_OK;
 }
 
@@ -298,11 +341,17 @@ esp_err_t FTPHTTPProxy::delete_file_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
-  char buffer[256];
-  snprintf(buffer, sizeof(buffer), "DELE %s\r\n", file_name.c_str());
+  // Allouer le buffer en SPIRAM
+  char* buffer = (char*)heap_caps_malloc(256, MALLOC_CAP_SPIRAM);
+  if (!buffer) {
+    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
+    return ESP_FAIL;
+  }
+
+  snprintf(buffer, 256, "DELE %s\r\n", file_name.c_str());
   send(proxy->sock_, buffer, strlen(buffer), 0);
 
-  int bytes_received = recv(proxy->sock_, buffer, sizeof(buffer) - 1, 0);
+  int bytes_received = recv(proxy->sock_, buffer, 255, 0);
   buffer[bytes_received] = '\0';
 
   if (strstr(buffer, "250 ")) {
@@ -315,6 +364,9 @@ esp_err_t FTPHTTPProxy::delete_file_handler(httpd_req_t *req) {
   ::close(proxy->sock_);
   proxy->sock_ = -1;
 
+  // Libérer le buffer
+  heap_caps_free(buffer);
+
   return ESP_OK;
 }
 
@@ -326,71 +378,117 @@ esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
-  char boundary[100];
+  // Allouer les buffers en SPIRAM
+  char* boundary = (char*)heap_caps_malloc(100, MALLOC_CAP_SPIRAM);
+  if (!boundary) {
+    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le boundary");
+    return ESP_FAIL;
+  }
+
   size_t boundary_len = httpd_req_get_hdr_value_len(req, "Content-Type");
   if (boundary_len <= 0) {
+    heap_caps_free(boundary);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid Content-Type");
     return ESP_FAIL;
   }
 
+  // Allouer content_type en SPIRAM via std::string
   std::string content_type;
   content_type.resize(boundary_len);
   httpd_req_get_hdr_value_str(req, "Content-Type", &content_type[0], boundary_len);
 
   size_t pos = content_type.find("boundary=");
   if (pos == std::string::npos) {
+    heap_caps_free(boundary);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Boundary not found");
     return ESP_FAIL;
   }
 
   std::string boundary_str = content_type.substr(pos + 9);
   std::string file_name;
-  std::string file_data;
-
-  char buffer[1024];
+  
+  // Allouer le buffer de données en SPIRAM
+  char* buffer = (char*)heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+  if (!buffer) {
+    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer de données");
+    heap_caps_free(boundary);
+    return ESP_FAIL;
+  }
+  
+  // Utiliser SPIRAM pour stocker les données du fichier
+  void* file_data_ptr = heap_caps_malloc(req->content_len, MALLOC_CAP_SPIRAM);
+  if (!file_data_ptr) {
+    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour les données du fichier");
+    heap_caps_free(buffer);
+    heap_caps_free(boundary);
+    return ESP_FAIL;
+  }
+  
+  char* file_data = (char*)file_data_ptr;
+  int file_data_len = 0;
+  
   int ret, remaining = req->content_len;
 
   while (remaining > 0) {
-    ret = httpd_req_recv(req, buffer, std::min(remaining, (int)sizeof(buffer)));
+    ret = httpd_req_recv(req, buffer, std::min(remaining, 1024));
     if (ret <= 0) {
+      heap_caps_free(file_data);
+      heap_caps_free(buffer);
+      heap_caps_free(boundary);
       httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Error receiving data");
       return ESP_FAIL;
     }
 
+    // Copier les données dans le buffer SPIRAM
+    memcpy(file_data + file_data_len, buffer, ret);
+    file_data_len += ret;
     remaining -= ret;
-    file_data.append(buffer, ret);
   }
 
-  pos = file_data.find("filename=\"");
+  // Analyser pour trouver le nom de fichier
+  std::string file_data_str(file_data, file_data_len);
+  pos = file_data_str.find("filename=\"");
   if (pos == std::string::npos) {
+    heap_caps_free(file_data);
+    heap_caps_free(buffer);
+    heap_caps_free(boundary);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Filename not found");
     return ESP_FAIL;
   }
 
-  size_t end_pos = file_data.find("\"", pos + 10);
-  file_name = file_data.substr(pos + 10, end_pos - pos - 10);
+  size_t end_pos = file_data_str.find("\"", pos + 10);
+  file_name = file_data_str.substr(pos + 10, end_pos - pos - 10);
 
-  pos = file_data.find("\r\n\r\n");
+  pos = file_data_str.find("\r\n\r\n");
   if (pos == std::string::npos) {
+    heap_caps_free(file_data);
+    heap_caps_free(buffer);
+    heap_caps_free(boundary);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "File content not found");
     return ESP_FAIL;
   }
 
-  file_data = file_data.substr(pos + 4);
-  end_pos = file_data.rfind("--" + boundary_str + "--");
+  file_data_str = file_data_str.substr(pos + 4);
+  end_pos = file_data_str.rfind("--" + boundary_str + "--");
   if (end_pos == std::string::npos) {
+    heap_caps_free(file_data);
+    heap_caps_free(buffer);
+    heap_caps_free(boundary);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid file content");
     return ESP_FAIL;
   }
 
-  file_data = file_data.substr(0, end_pos);
+  file_data_str = file_data_str.substr(0, end_pos);
 
   char buffer_cmd[256];
   snprintf(buffer_cmd, sizeof(buffer_cmd), "STOR %s\r\n", file_name.c_str());
   send(proxy->sock_, buffer_cmd, strlen(buffer_cmd), 0);
 
-  int bytes_sent = send(proxy->sock_, file_data.c_str(), file_data.length(), 0);
+  int bytes_sent = send(proxy->sock_, file_data_str.c_str(), file_data_str.length(), 0);
   if (bytes_sent <= 0) {
+    heap_caps_free(file_data);
+    heap_caps_free(buffer);
+    heap_caps_free(boundary);
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Error uploading file");
     return ESP_FAIL;
   }
@@ -400,6 +498,11 @@ esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
   send(proxy->sock_, "QUIT\r\n", 6, 0);
   ::close(proxy->sock_);
   proxy->sock_ = -1;
+
+  // Libérer toutes les allocations SPIRAM
+  heap_caps_free(file_data);
+  heap_caps_free(buffer);
+  heap_caps_free(boundary);
 
   return ESP_OK;
 }
@@ -413,10 +516,18 @@ void FTPHTTPProxy::setup_http_server() {
   config.send_wait_timeout = 20;
   config.max_uri_handlers = 8;
   config.max_resp_headers = 20;
-  config.stack_size = 12288;
-
-  // Set task priority higher
+  
+  // Augmenter la taille de la pile, en utilisant SPIRAM si disponible
+  config.stack_size = 16384;  // Augmenter la taille
+  
+  // Définir une priorité de tâche plus élevée
   config.task_priority = tskIDLE_PRIORITY + 5;
+  
+  // Activer la purge LRU pour économiser de la mémoire
+  config.lru_purge_enable = true;
+
+  // Utiliser plus de SPIRAM avec plus de connexions simultanées
+  config.max_open_sockets = 7;  // Valeur par défaut: 7
 
   if (httpd_start(&server_, &config) != ESP_OK) {
     ESP_LOGE(TAG, "Échec du démarrage du serveur HTTP");
@@ -456,6 +567,23 @@ void FTPHTTPProxy::setup_http_server() {
   httpd_register_uri_handler(server_, &uri_upload);
 
   ESP_LOGI(TAG, "Serveur HTTP démarré sur le port %d", local_port_);
+}
+
+// Ces méthodes statiques sont uniquement des wrappers pour les méthodes membres
+esp_err_t FTPHTTPProxy::static_http_req_handler(httpd_req_t *req) {
+  return ((FTPHTTPProxy *)req->user_ctx)->http_req_handler(req);
+}
+
+esp_err_t FTPHTTPProxy::static_list_files_handler(httpd_req_t *req) {
+  return ((FTPHTTPProxy *)req->user_ctx)->list_files_handler(req);
+}
+
+esp_err_t FTPHTTPProxy::static_delete_file_handler(httpd_req_t *req) {
+  return ((FTPHTTPProxy *)req->user_ctx)->delete_file_handler(req);
+}
+
+esp_err_t FTPHTTPProxy::static_upload_file_handler(httpd_req_t *req) {
+  return ((FTPHTTPProxy *)req->user_ctx)->upload_file_handler(req);
 }
 
 }  // namespace ftp_http_proxy
