@@ -197,7 +197,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     }
     
     // Yield plus fréquemment, surtout pour les grands transferts
-    if (bytes_received >= 4096) {
+    if (bytes_received >= 32768) {
       vTaskDelay(pdMS_TO_TICKS(5));
     } else {
       vTaskDelay(pdMS_TO_TICKS(1));
@@ -210,7 +210,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   ::close(data_sock);
   data_sock = -1;
 
-  bytes_received = recv(sock_, buffer, 8191, 0);
+  bytes_received = recv(sock_, buffer, 65536, 0);
   if (bytes_received > 0 && strstr(buffer, "226 ")) {
     success = true;
     buffer[bytes_received] = '\0';
