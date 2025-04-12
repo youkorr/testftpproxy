@@ -22,9 +22,9 @@ void FTPHTTPProxy::setup() {
 
   // Initialize Task Watchdog Timer with new API
   esp_task_wdt_config_t twdt_config = {
-    .timeout_ms = 30000,  // 30 second timeout
+    .timeout_ms = 60000,  // 30 second timeout
     .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,  // Check all cores
-    .trigger_panic = true  // Panic on timeout
+    .trigger_panic = false // Panic on timeout
   };
   esp_task_wdt_init(&twdt_config);
   esp_task_wdt_add(NULL); // Add current task
