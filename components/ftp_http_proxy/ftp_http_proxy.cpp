@@ -272,7 +272,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     // Yield plus souvent pour les fichiers média
     if (is_media_file) {
       // Yield plus souvent pour les fichiers média
-      vTaskDelay(pdMS_TO_TICKS(10));  // Augmenté à 10ms
+      vTaskDelay(pdMS_TO_TICKS(5));  // Augmenté à 10ms
     } else {
       vTaskDelay(pdMS_TO_TICKS(1));
     }
