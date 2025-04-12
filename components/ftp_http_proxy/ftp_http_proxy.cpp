@@ -265,7 +265,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     
     // Comptez les chunks pour les fichiers média pour surveiller la progression
     chunk_count++;
-    if (is_media_file && (chunk_count % 100 == 0)) {
+    if (is_media_file && (chunk_count % 200 == 0)) {
       ESP_LOGD(TAG, "Streaming média: %d chunks envoyés", chunk_count);
     }
     
