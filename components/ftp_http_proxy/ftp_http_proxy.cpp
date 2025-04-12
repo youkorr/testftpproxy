@@ -7,7 +7,7 @@
 #include <arpa/inet.h>
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
-#include "esp_spiram.h"
+#include "esp_psram.h"
 
 static const char *TAG = "ftp_proxy";
 
