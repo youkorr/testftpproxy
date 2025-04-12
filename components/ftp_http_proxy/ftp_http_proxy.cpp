@@ -147,7 +147,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   }
 
   bool is_media_file = (extension == ".mp3" || extension == ".mp4" || extension == ".wav" || extension == ".ogg");
-  int buffer_size = is_media_file ? 4096 : 16384;
+  int buffer_size = is_media_file ? 2048 : 16384;
 
   buffer[0] = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
   buffer[1] = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
