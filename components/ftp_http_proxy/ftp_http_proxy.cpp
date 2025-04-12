@@ -149,7 +149,9 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   }
 
   bool is_media_file = (extension == ".mp3" || extension == ".mp4" || 
-                        extension == ".wav" || extension == ".ogg");
+                        extension == ".wav" || extension == ".ogg" || 
+                        extension == ".png" ||extension == ".jpg");
+                        extension == ".avi");
 
   // Réduire encore plus la taille du buffer pour les fichiers média
   // Buffer plus petit pour permettre des reset WDT plus fréquents
