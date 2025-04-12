@@ -46,9 +46,16 @@ void SdMmc::dump_config() {
     ESP_LOGCONFIG(TAG, "  DATA2 Pin: %d", this->data2_pin_);
     ESP_LOGCONFIG(TAG, "  DATA3 Pin: %d", this->data3_pin_);
   }
-
   if (this->power_ctrl_pin_ != nullptr) {
     LOG_PIN("  Power Ctrl Pin: ", this->power_ctrl_pin_);
+  }
+
+  if (!this->is_failed()) {
+    const char *freq_unit = card->real_freq_khz < 1000 ? "kHz" : "MHz";
+    const float freq = card->real_freq_khz < 1000 ? card->real_freq_khz : card->real_freq_khz / 1000.0;
+    const char *max_freq_unit = card->max_freq_khz < 1000 ? "kHz" : "MHz";
+    const float max_freq = card->max_freq_khz < 1000 ? card->max_freq_khz : card->max_freq_khz / 1000.0;
+    ESP_LOGCONFIG(TAG, "  Card Speed:  %.2f %s (limit: %.2f %s)%s", freq, freq_unit, max_freq, max_freq_unit, card->is_ddr ? ", DDR" : "");
   }
 
 #ifdef USE_SENSOR
@@ -63,13 +70,11 @@ void SdMmc::dump_config() {
 #ifdef USE_TEXT_SENSOR
   LOG_TEXT_SENSOR("  ", "SD Card Type", this->sd_card_type_text_sensor_);
 #endif
-
   if (this->is_failed()) {
     ESP_LOGE(TAG, "Setup failed : %s", SdMmc::error_code_to_string(this->init_error_).c_str());
     return;
   }
 }
-
 #ifdef USE_ESP_IDF
 void SdMmc::setup() {
   // Enable SDCard power if power control pin is configured
