@@ -121,6 +121,9 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   int flag = 1;
   int rcvbuf = 32768;
   int chunk_count = 0;
+  // Variables pour le suivi du temps pour le WDT
+  uint32_t last_wdt_reset = 0;
+  uint32_t current_time = 0;
   
   // Obtenir le handle de la tâche actuelle pour le watchdog
   TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
@@ -161,12 +164,17 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     return false;
   }
 
+  // Initialiser le timer pour le WDT
+  last_wdt_reset = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  
   // Réinitialiser le watchdog avant des opérations potentiellement longues
   if (wdt_initialized) esp_task_wdt_reset();
 
   if (!connect_to_ftp()) {
     ESP_LOGE(TAG, "Échec de connexion FTP");
-    goto error;
+    heap_caps_free(buffer);
+    if (wdt_initialized) esp_task_wdt_delete(current_task);
+    return false;
   }
 
   // Configuration spéciale pour les fichiers média
@@ -207,7 +215,9 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif");
-    goto error;
+    heap_caps_free(buffer);
+    if (wdt_initialized) esp_task_wdt_delete(current_task);
+    return false;
   }
   buffer[bytes_received] = '\0';
   ESP_LOGD(TAG, "Réponse PASV: %s", buffer);
@@ -215,7 +225,9 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   pasv_start = strchr(buffer, '(');
   if (!pasv_start) {
     ESP_LOGE(TAG, "Format PASV incorrect");
-    goto error;
+    heap_caps_free(buffer);
+    if (wdt_initialized) esp_task_wdt_delete(current_task);
+    return false;
   }
   sscanf(pasv_start, "(%d,%d,%d,%d,%d,%d)", &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]);
   data_port = port[0] * 256 + port[1];
@@ -227,7 +239,9 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   data_sock = ::socket(AF_INET, SOCK_STREAM, 0);
   if (data_sock < 0) {
     ESP_LOGE(TAG, "Échec de création du socket de données");
-    goto error;
+    heap_caps_free(buffer);
+    if (wdt_initialized) esp_task_wdt_delete(current_task);
+    return false;
   }
 
   setsockopt(data_sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
@@ -244,7 +258,10 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
 
   if (::connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
     ESP_LOGE(TAG, "Échec de connexion au port de données");
-    goto error;
+    ::close(data_sock);
+    heap_caps_free(buffer);
+    if (wdt_initialized) esp_task_wdt_delete(current_task);
+    return false;
   }
 
   snprintf(buffer, buffer_size, "RETR %s\r\n", remote_path.c_str());
@@ -253,17 +270,17 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
     ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
-    goto error;
+    ::close(data_sock);
+    heap_caps_free(buffer);
+    if (wdt_initialized) esp_task_wdt_delete(current_task);
+    return false;
   }
   buffer[bytes_received] = '\0';
 
-  // Pour les fichiers média, envoyer en plus petits chunks avec plus de yields
-  uint32_t last_wdt_reset = esp_timer_get_time() / 1000;
-  uint32_t current_time;
-  
+  // Pour les fichiers média, envoyer en plus petits chunks avec plus de yields  
   while (true) {
     // Réinitialiser le watchdog plus souvent, toutes les 500ms maximum
-    current_time = esp_timer_get_time() / 1000;
+    current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (current_time - last_wdt_reset >= 500) {  // 500ms
       if (wdt_initialized) {
         esp_task_wdt_reset();
@@ -283,7 +300,10 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
-      goto error;
+      ::close(data_sock);
+      heap_caps_free(buffer);
+      if (wdt_initialized) esp_task_wdt_delete(current_task);
+      return false;
     }
     
     // Comptez les chunks pour les fichiers média pour surveiller la progression
@@ -329,22 +349,6 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   }
   
   return success;
-
-error:
-  if (buffer) heap_caps_free(buffer);
-  if (data_sock != -1) ::close(data_sock);
-  if (sock_ != -1) {
-    send(sock_, "QUIT\r\n", 6, 0);
-    ::close(sock_);
-    sock_ = -1;
-  }
-  
-  // Retirer la tâche du watchdog en cas d'erreur
-  if (wdt_initialized) {
-    esp_task_wdt_delete(current_task);
-  }
-  
-  return false;
 }
 
 esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
