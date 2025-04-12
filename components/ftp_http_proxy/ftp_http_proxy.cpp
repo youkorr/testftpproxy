@@ -120,6 +120,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   int bytes_received;
   int flag = 1;
   int rcvbuf = 32768;
+  int chunk_count = 0;  // Déplacé ici en haut pour éviter le problème de goto
 
   // Détecter si c'est un fichier média
   std::string extension = "";
@@ -212,7 +213,6 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   buffer[bytes_received] = '\0';
 
   // Streaming avec des chunks plus petits pour les fichiers média
-  int chunk_count = 0;
   while (true) {
     bytes_received = recv(data_sock, buffer, buffer_size, 0);
     if (bytes_received <= 0) {
