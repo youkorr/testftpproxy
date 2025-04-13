@@ -1,4 +1,5 @@
 #include "sd_mmc_card.h"
+#include "esp_task_wdt.h"
 
 #include <algorithm>
 #include <vector>
@@ -384,99 +385,65 @@ bool SdMmc::delete_file(const char *path) {
   return true;
 }
 
-std::vector<uint8_t> SdMmc::read_file(char const *path) {
+// Lecture complète d'un fichier
+std::vector<uint8_t> SdMmc::read_file(const char *path) {
   ESP_LOGV(TAG, "Read File: %s", path);
 
   std::string absolut_path = build_path(path);
-  FILE *file = nullptr;
-  file = fopen(absolut_path.c_str(), "rb");
+  FILE *file = fopen(absolut_path.c_str(), "rb");
   if (file == nullptr) {
-    ESP_LOGE(TAG, "Failed to open file for reading");
-    return std::vector<uint8_t>();
+    ESP_LOGE(TAG, "Failed to open file for reading: %s", absolut_path.c_str());
+    return {};
   }
 
-  std::vector<uint8_t> res;
-  size_t fileSize = this->file_size(path);
-  res.resize(fileSize);
-  size_t len = fread(res.data(), 1, fileSize, file);
-  fclose(file);
-  if (len < 0) {
-    ESP_LOGE(TAG, "Failed to read file: %s", strerror(errno));
-    return std::vector<uint8_t>();
+  std::unique_ptr<FILE, decltype(&fclose)> file_guard(file, fclose);
+  size_t file_size = this->file_size(path);
+
+  std::vector<uint8_t> res(file_size);
+  size_t read_len = fread(res.data(), 1, file_size, file);
+
+  if (read_len != file_size) {
+    ESP_LOGE(TAG, "Read incomplete: expected %zu bytes, got %zu (%s)", file_size, read_len, strerror(errno));
+    return {};
   }
 
   return res;
 }
 
-void SdMmc::read_file_stream(const char *path, size_t offset, size_t chunk_size, 
+// Lecture en streaming par chunks avec reset du WDT
+void SdMmc::read_file_stream(const char *path, size_t offset, size_t chunk_size,
                              std::function<void(const uint8_t*, size_t)> callback) {
-    std::string absolut_path = build_path(path);
-    FILE *file = fopen(absolut_path.c_str(), "rb");
-    if (!file) {
-        ESP_LOGE(TAG, "Failed to open file: %s", absolut_path.c_str());
-        return;
+  std::string absolut_path = build_path(path);
+  FILE *file = fopen(absolut_path.c_str(), "rb");
+  if (!file) {
+    ESP_LOGE(TAG, "Failed to open file: %s", absolut_path.c_str());
+    return;
+  }
+
+  std::unique_ptr<FILE, decltype(&fclose)> file_guard(file, fclose);
+
+  if (fseek(file, offset, SEEK_SET) != 0) {
+    ESP_LOGE(TAG, "Failed to seek to position %zu in file: %s (errno: %d)", offset, absolut_path.c_str(), errno);
+    return;
+  }
+
+  std::vector<uint8_t> buffer(chunk_size);
+  size_t read = 0;
+  size_t bytes_since_reset = 0;
+
+  while ((read = fread(buffer.data(), 1, chunk_size, file)) > 0) {
+    callback(buffer.data(), read);
+    bytes_since_reset += read;
+
+    if (bytes_since_reset >= 32 * 1024) {
+      esp_task_wdt_reset();
+      bytes_since_reset = 0;
     }
+  }
 
-    std::unique_ptr<FILE, decltype(&fclose)> file_guard(file, fclose);
-
-    if (fseek(file, offset, SEEK_SET) != 0) {
-        ESP_LOGE(TAG, "Failed to seek to position %zu in file: %s (errno: %d)", offset, absolut_path.c_str(), errno);
-        return;
-    }
-
-    std::vector<uint8_t> buffer(chunk_size);
-    size_t read;
-    size_t bytes_since_reset = 0;
-
-    while ((read = fread(buffer.data(), 1, chunk_size, file)) > 0) {
-        callback(buffer.data(), read);
-
-        bytes_since_reset += read;
-        if (bytes_since_reset >= 32 * 1024) {  // Reset WDT toutes les 32 Ko lues
-            esp_task_wdt_reset();
-            bytes_since_reset = 0;
-        }
-    }
-
-    if (ferror(file)) {
-        ESP_LOGE(TAG, "Error reading file: %s", absolut_path.c_str());
-    }
-}
-
-// Fonction de streaming avec protection WDT
-void SdMmc::read_file_stream(const char *path, size_t offset, size_t chunk_size, 
-                             std::function<void(const uint8_t*, size_t)> callback) {
-    std::string absolut_path = build_path(path);
-    FILE *file = fopen(absolut_path.c_str(), "rb");
-    if (!file) {
-        ESP_LOGE(TAG, "Failed to open file: %s", absolut_path.c_str());
-        return;
-    }
-
-    std::unique_ptr<FILE, decltype(&fclose)> file_guard(file, fclose);
-
-    if (fseek(file, offset, SEEK_SET) != 0) {
-        ESP_LOGE(TAG, "Failed to seek to position %zu in file: %s (errno: %d)", offset, absolut_path.c_str(), errno);
-        return;
-    }
-
-    std::vector<uint8_t> buffer(chunk_size);
-    size_t read;
-    size_t bytes_since_last_reset = 0;
-
-    while ((read = fread(buffer.data(), 1, chunk_size, file)) > 0) {
-        callback(buffer.data(), read);
-        bytes_since_last_reset += read;
-
-        if (bytes_since_last_reset >= 32 * 1024) {
-            esp_task_wdt_reset();
-            bytes_since_last_reset = 0;
-        }
-    }
-
-    if (ferror(file)) {
-        ESP_LOGE(TAG, "Error reading file: %s", absolut_path.c_str());
-    }
+  if (ferror(file)) {
+    ESP_LOGE(TAG, "Error reading file: %s", absolut_path.c_str());
+  }
 }
 
 
