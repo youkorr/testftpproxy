@@ -217,7 +217,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   // Pour les fichiers média, envoyer en plus petits chunks avec plus de yields
   while (true) {
     // Réinitialiser le watchdog avant chaque itération pour les fichiers média
-    if (is_media_file && (chunk_count % 5 == 0) && wdt_initialized) {
+    if (is_media_file && wdt_initialized) {
       esp_task_wdt_reset();
     }
     
@@ -244,8 +244,6 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     // Yield plus souvent pour les fichiers média
     if (is_media_file) {
       // Yield plus souvent pour les fichiers média
-      vTaskDelay(pdMS_TO_TICKS(10));  // Augmenté à 10ms
-    } else {
       vTaskDelay(pdMS_TO_TICKS(1));
     }
   }
