@@ -15,6 +15,8 @@ namespace ftp_http_proxy {
 
 void FTPHTTPProxy::setup() {
   ESP_LOGI(TAG, "Initialisation du proxy FTP/HTTP");
+
+  struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
   
   // Configuration du watchdog avec un délai plus long
   esp_task_wdt_config_t wdt_config = {
