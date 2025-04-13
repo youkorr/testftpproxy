@@ -7,6 +7,7 @@
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
+#include "esp_http_server.h"
 
 static const char *TAG = "ftp_proxy";
 
@@ -330,7 +331,7 @@ error:
 }
 
 esp_err_t FTPHTTPProxy::list_files_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  FTPHTTPProxy *proxy = (FTPHTTPProxy *)req->user_ctx;
   if (!proxy->connect_to_ftp()) {
     ESP_LOGE(TAG, "Échec de connexion FTP");
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de connexion FTP");
@@ -367,7 +368,7 @@ esp_err_t FTPHTTPProxy::list_files_handler(httpd_req_t *req) {
 }
 
 esp_err_t FTPHTTPProxy::delete_file_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  FTPHTTPProxy *proxy = (FTPHTTPProxy *)req->user_ctx;
   std::string file_name = req->uri + strlen("/delete/");
   ESP_LOGI(TAG, "Suppression du fichier: %s", file_name.c_str());
 
@@ -407,7 +408,7 @@ esp_err_t FTPHTTPProxy::delete_file_handler(httpd_req_t *req) {
 }
 
 esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  FTPHTTPProxy *proxy = (FTPHTTPProxy *)req->user_ctx;
   if (!proxy->connect_to_ftp()) {
     ESP_LOGE(TAG, "Échec de connexion FTP");
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de connexion FTP");
@@ -605,8 +606,7 @@ esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
 
 void FTPHTTPProxy::setup_http_server() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.uri_match_fn = httpd_uri_match_wildcard;
-  config.user_ctx = this;
+  config.task_priority = 5;
 
   ESP_LOGI(TAG, "Démarrage du serveur HTTP sur le port : %d", config.server_port);
   if (httpd_start(&http_server_, &config) == ESP_OK) {
@@ -623,15 +623,19 @@ void FTPHTTPProxy::setup_http_server() {
     httpd_uri_t list_files_uri = {
       .uri       = "/list",
       .method    = HTTP_GET,
-      .handler   = list_files_handler,
+      .handler   = [](httpd_req_t *req){
+        return static_cast<FTPHTTPProxy*>(req->user_ctx)->list_files_handler(req);
+      },
       .user_ctx  = this
     };
     httpd_register_uri_handler(http_server_, &list_files_uri);
 
-      httpd_uri_t delete_file_uri = {
+    httpd_uri_t delete_file_uri = {
       .uri       = "/delete/*",
       .method    = HTTP_DELETE,
-      .handler   = delete_file_handler,
+      .handler   = [](httpd_req_t *req){
+        return static_cast<FTPHTTPProxy*>(req->user_ctx)->delete_file_handler(req);
+      },
       .user_ctx  = this
     };
     httpd_register_uri_handler(http_server_, &delete_file_uri);
@@ -639,7 +643,9 @@ void FTPHTTPProxy::setup_http_server() {
     httpd_uri_t upload_file_uri = {
       .uri       = "/upload",
       .method    = HTTP_POST,
-      .handler   = upload_file_handler,
+      .handler   = [](httpd_req_t *req){
+        return static_cast<FTPHTTPProxy*>(req->user_ctx)->upload_file_handler(req);
+      },
       .user_ctx  = this
     };
     httpd_register_uri_handler(http_server_, &upload_file_uri);
@@ -650,7 +656,7 @@ void FTPHTTPProxy::setup_http_server() {
 }
 
 esp_err_t FTPHTTPProxy::static_http_req_handler(httpd_req_t *req) {
-  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  FTPHTTPProxy *proxy = (FTPHTTPProxy *)req->user_ctx;
   ESP_LOGI(TAG, "URI: %s", req->uri);
   std::string uri = req->uri;
   
@@ -658,7 +664,7 @@ esp_err_t FTPHTTPProxy::static_http_req_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, "<html><body><h1>It works!</h1><p>Proxy FTP/HTTP actif.</p></body></html>", HTTPD_RESP_USE_STRLEN);
   } else if (uri == "/list") {
-      return proxy->list_files_handler(req);
+    return proxy->list_files_handler(req);
   } else if (uri.rfind("/delete/", 0) == 0) {
     return proxy->delete_file_handler(req);
   } else if (uri == "/upload") {
@@ -683,4 +689,5 @@ esp_err_t FTPHTTPProxy::static_http_req_handler(httpd_req_t *req) {
 
 } // namespace ftp_http_proxy
 } // namespace esphome
+
 
