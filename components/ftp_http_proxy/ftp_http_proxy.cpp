@@ -407,11 +407,11 @@ void FTPHTTPProxy::setup_http_server() {
   config.uri_match_fn = httpd_uri_match_wildcard;
   
   // Augmenter les limites pour gérer les grandes requêtes
-  config.recv_wait_timeout = 30;      // Augmenté à 30 secondes
-  config.send_wait_timeout = 30;      // Augmenté à 30 secondes
-  config.max_uri_handlers = 8;
-  config.max_resp_headers = 20;
-  config.stack_size = 12288;          // Augmentation de la taille de la pile
+  config.recv_wait_timeout = 240;      // Augmenté à 30 secondes
+  config.send_wait_timeout = 240;      // Augmenté à 30 secondes
+  config.max_uri_handlers = true;
+  config.max_resp_headers = 32;
+  config.stack_size = 16384;          // Augmentation de la taille de la pile
 
   if (httpd_start(&server_, &config) != ESP_OK) {
     ESP_LOGE(TAG, "Échec du démarrage du serveur HTTP");
