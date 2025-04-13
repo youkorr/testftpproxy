@@ -22,9 +22,9 @@ void FTPHTTPProxy::setup() {
 
   // Initialize Task Watchdog Timer with new API
   esp_task_wdt_config_t twdt_config = {
-    .timeout_ms = 30000,  // 30 second timeout
+    .timeout_ms = 10000,  // 30 second timeout
     .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,  // Check all cores
-    .trigger_panic = false  // Panic on timeout
+    .trigger_panic = true  // Panic on timeout
   };
   esp_task_wdt_init(&twdt_config);
   esp_task_wdt_add(NULL); // Add current task
@@ -149,7 +149,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
                         extension == ".wav" || extension == ".ogg");
 
   // Réduire encore plus la taille du buffer pour les fichiers média
-  int buffer_size = is_media_file ? 2048 : 8192;
+  int buffer_size = is_media_file ? 4096 : 8192;
   
   // Allouer le buffer en SPIRAM
   char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
@@ -267,13 +267,22 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     if (is_media_file && (chunk_count % 100 == 0)) {
       ESP_LOGD(TAG, "Streaming média: %d chunks envoyés", chunk_count);
     }
-    
+        // Add near the beginning of your function
+    if (is_media_file && remote_path.size() > 20 * 1024 * 1024) {
+      // Increase watchdog timeout for large files
+      esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = 10000,  // 10 seconds instead of default
+        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+        .trigger_panic = true
+      };
+      esp_task_wdt_reconfigure(&wdt_config);
+    }
     // Yield plus souvent pour les fichiers média
     if (is_media_file) {
       // Yield plus souvent pour les fichiers média
-      vTaskDelay(pdMS_TO_TICKS(10));  // Augmenté à 10ms
+      vTaskDelay(pdMS_TO_TICKS(50));  // Augmenté à 10ms
     } else {
-      vTaskDelay(pdMS_TO_TICKS(1));
+      vTaskDelay(pdMS_TO_TICKS(5));
     }
   }
 
