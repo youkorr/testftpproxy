@@ -4,6 +4,7 @@
 #include <string>
 #include <esp_http_server.h>
 #include <lwip/sockets.h>
+#include "esphome/core/component.h"
 
 namespace esphome {
 namespace ftp_http_proxy {
