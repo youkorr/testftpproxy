@@ -24,7 +24,7 @@ void FTPHTTPProxy::setup() {
   esp_task_wdt_config_t twdt_config = {
     .timeout_ms = 30000,  // 30 second timeout
     .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,  // Check all cores
-    .trigger_panic = true  // Panic on timeout
+    .trigger_panic = false  // Panic on timeout
   };
   esp_task_wdt_init(&twdt_config);
   esp_task_wdt_add(NULL); // Add current task
@@ -149,7 +149,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
                         extension == ".wav" || extension == ".ogg");
 
   // Réduire encore plus la taille du buffer pour les fichiers média
-  int buffer_size = is_media_file ? 4096 : 16384;
+  int buffer_size = is_media_file ? 2048 : 8192;
   
   // Allouer le buffer en SPIRAM
   char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
