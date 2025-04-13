@@ -15,6 +15,20 @@ namespace ftp_http_proxy {
 
 void FTPHTTPProxy::setup() {
   ESP_LOGI(TAG, "Initialisation du proxy FTP/HTTP");
+  
+  // Configuration du watchdog avec un délai plus long
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 10000,  // Augmenter à 10 secondes (défaut est 5s)
+    .idle_core_mask = 0,  // Sans surveillance des cœurs inactifs
+    .trigger_panic = true
+  };
+  esp_err_t err = esp_task_wdt_init(&wdt_config);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Impossible de configurer le watchdog: %d", err);
+  } else {
+    ESP_LOGI(TAG, "Watchdog configuré avec timeout de 10s");
+  }
+  
   this->setup_http_server();
 }
 
