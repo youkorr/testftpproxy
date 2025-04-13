@@ -36,6 +36,13 @@ void FTPHTTPProxy::loop() {
   esp_task_wdt_reset();  
 }
 
+esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "HTTP request handler called");
+    httpd_resp_send_chunk(req, "<html><body><h1>It works!</h1></body></html>", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, nullptr, 0);
+    return ESP_OK;
+}
+
 bool FTPHTTPProxy::connect_to_ftp() {
   struct hostent *ftp_host = gethostbyname(ftp_server_.c_str());
   if (!ftp_host) {
@@ -216,7 +223,6 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
 
   setsockopt(data_sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
   setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
   struct sockaddr_in data_addr;
   memset(&data_addr, 0, sizeof(data_addr));
   data_addr.sin_family = AF_INET;
@@ -322,7 +328,6 @@ error:
   
   return false;
 }
-
 
 esp_err_t FTPHTTPProxy::list_files_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
@@ -500,122 +505,182 @@ esp_err_t FTPHTTPProxy::upload_file_handler(httpd_req_t *req) {
   }
 
   file_data_str = file_data_str.substr(pos + 4);
-  end_pos = file_data_str.rfind("--" + boundary_str + "--");
-  if (end_pos == std::string::npos) {
+  size_t content_start = 0;
+    
+  std::string upload_path = "/" + file_name;
+  
+  // Mode passif pour l'upload
+  char pasv_cmd[32];
+  snprintf(pasv_cmd, sizeof(pasv_cmd), "PASV\r\n");
+  send(proxy->sock_, pasv_cmd, strlen(pasv_cmd), 0);
+
+  // Allouer le buffer en SPIRAM
+  char* pasv_response = (char*)heap_caps_malloc(256, MALLOC_CAP_SPIRAM);
+  if (!pasv_response) {
+    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour la réponse PASV");
     heap_caps_free(file_data);
     heap_caps_free(buffer);
     heap_caps_free(boundary);
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid file content");
     return ESP_FAIL;
   }
+    
+  int bytes_received = recv(proxy->sock_, pasv_response, 255, 0);
+  pasv_response[bytes_received] = '\0';
+  ESP_LOGI(TAG, "Réponse PASV: %s", pasv_response);
 
-  file_data_str = file_data_str.substr(0, end_pos);
-
-  char buffer_cmd[256];
-  snprintf(buffer_cmd, sizeof(buffer_cmd), "STOR %s\r\n", file_name.c_str());
-  send(proxy->sock_, buffer_cmd, strlen(buffer_cmd), 0);
-
-  int bytes_sent = send(proxy->sock_, file_data_str.c_str(), file_data_str.length(), 0);
-  if (bytes_sent <= 0) {
+  int ip[4], port[2];
+  int data_port;
+  char *pasv_start_ptr = strchr(pasv_response, '(');
+  if (!pasv_start_ptr) {
+    ESP_LOGE(TAG, "Erreur: réponse PASV inattendue");
+    heap_caps_free(pasv_response);
     heap_caps_free(file_data);
     heap_caps_free(buffer);
     heap_caps_free(boundary);
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Error uploading file");
+    return ESP_FAIL;
+  }
+  sscanf(pasv_start_ptr, "(%d,%d,%d,%d,%d,%d)", &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]);
+  data_port = port[0] * 256 + port[1];
+  ESP_LOGI(TAG, "Port de données pour l'upload: %d", data_port);
+
+  struct sockaddr_in data_addr;
+  memset(&data_addr, 0, sizeof(data_addr));
+  data_addr.sin_family = AF_INET;
+  data_addr.sin_port = htons(data_port);
+  data_addr.sin_addr.s_addr = htonl((ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3]);
+
+  int data_sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (data_sock < 0) {
+    ESP_LOGE(TAG, "Échec de création du socket de données pour l'upload");
+    heap_caps_free(pasv_response);
+    heap_caps_free(file_data);
+    heap_caps_free(buffer);
+    heap_caps_free(boundary);
     return ESP_FAIL;
   }
 
-  httpd_resp_send(req, "File uploaded", HTTPD_RESP_USE_STRLEN);
+  if (::connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
+    ESP_LOGE(TAG, "Échec de connexion au port de données pour l'upload");
+    ::close(data_sock);
+    heap_caps_free(pasv_response);
+    heap_caps_free(file_data);
+    heap_caps_free(buffer);
+    heap_caps_free(boundary);
+    return ESP_FAIL;
+  }
 
-  send(proxy->sock_, "QUIT\r\n", 6, 0);
-  ::close(proxy->sock_);
-  proxy->sock_ = -1;
+  // Préparer la commande STOR
+  char stor_cmd[256];
+  snprintf(stor_cmd, sizeof(stor_cmd), "STOR %s\r\n", file_name.c_str());
+  send(proxy->sock_, stor_cmd, strlen(stor_cmd), 0);
 
-  // Libérer toutes les allocations SPIRAM
+  bytes_received = recv(proxy->sock_, pasv_response, 255, 0);
+  pasv_response[bytes_received] = '\0';
+  ESP_LOGI(TAG, "Réponse STOR: %s", pasv_response);
+
+  // Envoyer les données du fichier
+  int total_sent = 0;
+  while (total_sent < file_data_len) {
+    int send_len = std::min(file_data_len - total_sent, 1024);
+    int sent = send(data_sock, file_data + total_sent, send_len, 0);
+    if (sent < 0) {
+      ESP_LOGE(TAG, "Erreur lors de l'envoi des données: %d", errno);
+      break;
+    }
+    total_sent += sent;
+  }
+
+  ::close(data_sock);
+  heap_caps_free(pasv_response);
+  
+  // Nettoyer
   heap_caps_free(file_data);
   heap_caps_free(buffer);
   heap_caps_free(boundary);
 
+  httpd_resp_send_chunk(req, NULL, 0);
+  httpd_resp_sendstr(req, "Fichier uploadé avec succès");
   return ESP_OK;
 }
 
 void FTPHTTPProxy::setup_http_server() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.server_port = local_port_;
   config.uri_match_fn = httpd_uri_match_wildcard;
+  config.user_ctx = this;
 
-  config.recv_wait_timeout = 20;
-  config.send_wait_timeout = 20;
-  config.max_uri_handlers = 8;
-  config.max_resp_headers = 20;
-  
-  // Augmenter la taille de la pile, en utilisant SPIRAM si disponible
-  config.stack_size = 16384;  // Augmenter la taille
-  
-  // Définir une priorité de tâche plus élevée
-  config.task_priority = tskIDLE_PRIORITY + 5;
-  
-  // Activer la purge LRU pour économiser de la mémoire
-  config.lru_purge_enable = true;
+  ESP_LOGI(TAG, "Démarrage du serveur HTTP sur le port : %d", config.server_port);
+  if (httpd_start(&http_server_, &config) == ESP_OK) {
+    ESP_LOGI(TAG, "Enregistrement des URI ...");
+    
+    httpd_uri_t wildcard_uri = {
+      .uri       = "/*",
+      .method    = HTTP_GET,
+      .handler   = static_http_req_handler,
+      .user_ctx  = this
+    };
+    httpd_register_uri_handler(http_server_, &wildcard_uri);
 
-  // Utiliser plus de SPIRAM avec plus de connexions simultanées
-  config.max_open_sockets = 7;  // Valeur par défaut: 7
+    httpd_uri_t list_files_uri = {
+      .uri       = "/list",
+      .method    = HTTP_GET,
+      .handler   = list_files_handler,
+      .user_ctx  = this
+    };
+    httpd_register_uri_handler(http_server_, &list_files_uri);
 
-  if (httpd_start(&server_, &config) != ESP_OK) {
-    ESP_LOGE(TAG, "Échec du démarrage du serveur HTTP");
-    return;
+      httpd_uri_t delete_file_uri = {
+      .uri       = "/delete/*",
+      .method    = HTTP_DELETE,
+      .handler   = delete_file_handler,
+      .user_ctx  = this
+    };
+    httpd_register_uri_handler(http_server_, &delete_file_uri);
+
+    httpd_uri_t upload_file_uri = {
+      .uri       = "/upload",
+      .method    = HTTP_POST,
+      .handler   = upload_file_handler,
+      .user_ctx  = this
+    };
+    httpd_register_uri_handler(http_server_, &upload_file_uri);
+    
+  } else {
+    ESP_LOGI(TAG, "Erreur lors du démarrage du serveur HTTP");
   }
-
-  httpd_uri_t uri_proxy = {
-    .uri       = "/*",
-    .method    = HTTP_GET,
-    .handler   = static_http_req_handler,  // Utilisation du wrapper statique
-    .user_ctx  = this
-  };
-  httpd_register_uri_handler(server_, &uri_proxy);
-
-  httpd_uri_t uri_list = {
-    .uri       = "/list",
-    .method    = HTTP_GET,
-    .handler   = static_list_files_handler,  // Utilisation du wrapper statique
-    .user_ctx  = this
-  };
-  httpd_register_uri_handler(server_, &uri_list);
-
-  httpd_uri_t uri_delete = {
-    .uri       = "/delete/*",
-    .method    = HTTP_DELETE,
-    .handler   = static_delete_file_handler,  // Utilisation du wrapper statique
-    .user_ctx  = this
-  };
-  httpd_register_uri_handler(server_, &uri_delete);
-
-  httpd_uri_t uri_upload = {
-    .uri       = "/upload",
-    .method    = HTTP_POST,
-    .handler   = static_upload_file_handler,  // Utilisation du wrapper statique
-    .user_ctx  = this
-  };
-  httpd_register_uri_handler(server_, &uri_upload);
-
-  ESP_LOGI(TAG, "Serveur HTTP démarré sur le port %d", local_port_);
 }
 
-// Ces méthodes statiques sont uniquement des wrappers pour les méthodes membres
 esp_err_t FTPHTTPProxy::static_http_req_handler(httpd_req_t *req) {
-  return ((FTPHTTPProxy *)req->user_ctx)->http_req_handler(req);
+  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  ESP_LOGI(TAG, "URI: %s", req->uri);
+  std::string uri = req->uri;
+  
+  if (uri == "/") {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, "<html><body><h1>It works!</h1><p>Proxy FTP/HTTP actif.</p></body></html>", HTTPD_RESP_USE_STRLEN);
+  } else if (uri == "/list") {
+      return proxy->list_files_handler(req);
+  } else if (uri.rfind("/delete/", 0) == 0) {
+    return proxy->delete_file_handler(req);
+  } else if (uri == "/upload") {
+    return proxy->upload_file_handler(req);
+  }
+   else {
+    std::string remote_path = uri;
+    if (remote_path[0] == '/') {
+      remote_path = remote_path.substr(1);
+    }
+    if (proxy->download_file(remote_path, req)) {
+      ESP_LOGI(TAG, "Fichier servi avec succès: %s", remote_path.c_str());
+      return ESP_OK;
+    } else {
+      ESP_LOGE(TAG, "Échec du service du fichier: %s", remote_path.c_str());
+      httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Fichier non trouvé");
+      return ESP_FAIL;
+    }
+  }
+  return ESP_OK;
 }
 
-esp_err_t FTPHTTPProxy::static_list_files_handler(httpd_req_t *req) {
-  return ((FTPHTTPProxy *)req->user_ctx)->list_files_handler(req);
-}
+} // namespace ftp_http_proxy
+} // namespace esphome
 
-esp_err_t FTPHTTPProxy::static_delete_file_handler(httpd_req_t *req) {
-  return ((FTPHTTPProxy *)req->user_ctx)->delete_file_handler(req);
-}
-
-esp_err_t FTPHTTPProxy::static_upload_file_handler(httpd_req_t *req) {
-  return ((FTPHTTPProxy *)req->user_ctx)->upload_file_handler(req);
-}
-
-}  // namespace ftp_http_proxy
-}  // namespace esphome
