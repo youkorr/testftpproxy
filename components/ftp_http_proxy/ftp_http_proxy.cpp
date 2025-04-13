@@ -107,6 +107,8 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   int flag = 1;
   int rcvbuf = 32768;
   int chunk_count = 0;
+  size_t total_bytes_transferred = 0;
+  size_t bytes_since_reset = 0;
   
   // Obtenir le handle de la tâche actuelle pour le watchdog
   TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
@@ -135,8 +137,9 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   bool is_media_file = (extension == ".mp3" || extension == ".mp4" || 
                         extension == ".wav" || extension == ".ogg");
 
-  // Réduire encore plus la taille du buffer pour les fichiers média
-  int buffer_size = is_media_file ? 2048 : 8192;
+  // Ajuster la taille du buffer pour optimiser les performances
+  // Pour les fichiers média, utiliser un buffer plus petit pour des réponses plus fréquentes
+  int buffer_size = is_media_file ? 4096 : 8192;
   
   // Allouer le buffer en SPIRAM
   char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
@@ -230,17 +233,25 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
 
   // Pour les fichiers média, envoyer en plus petits chunks avec plus de yields
   while (true) {
-    // Réinitialiser le watchdog avant chaque itération pour les fichiers média
-    if (is_media_file && wdt_initialized) {
-      esp_task_wdt_reset();
-    }
-    
+    // Réinitialiser le watchdog plus fréquemment pour les fichiers volumineux
+    // Basé sur le volume de données transférées pour s'adapter à différentes vitesses
     bytes_received = recv(data_sock, buffer, buffer_size, 0);
     if (bytes_received <= 0) {
       if (bytes_received < 0) {
         ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
       }
       break;
+    }
+    
+    // Mise à jour des compteurs
+    total_bytes_transferred += bytes_received;
+    bytes_since_reset += bytes_received;
+    
+    // Pour les fichiers média, réinitialiser le watchdog tous les ~100Ko
+    if (is_media_file && bytes_since_reset >= 102400 && wdt_initialized) {
+      esp_task_wdt_reset();
+      bytes_since_reset = 0;
+      ESP_LOGD(TAG, "WDT reset après ~100 Ko, total transféré: %zu Ko", total_bytes_transferred / 1024);
     }
     
     esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
@@ -252,12 +263,13 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     // Comptez les chunks pour les fichiers média pour surveiller la progression
     chunk_count++;
     if (is_media_file && (chunk_count % 100 == 0)) {
-      ESP_LOGD(TAG, "Streaming média: %d chunks envoyés", chunk_count);
+      ESP_LOGD(TAG, "Streaming média: %d chunks envoyés, %zu Ko", chunk_count, total_bytes_transferred / 1024);
     }
     
-    // Yield plus souvent pour les fichiers média
+    // Yield plus souvent pour les fichiers média, mais avec un délai plus court
     if (is_media_file) {
-      // Yield plus souvent pour les fichiers média
+      vTaskDelay(pdMS_TO_TICKS(1));  // Délai minimal
+    } else {
       vTaskDelay(pdMS_TO_TICKS(1));
     }
   }
@@ -284,6 +296,9 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   
   httpd_resp_send_chunk(req, NULL, 0);
   
+  // Statistiques finales
+  ESP_LOGI(TAG, "Fichier transféré avec succès: %zu Ko, %d chunks", total_bytes_transferred / 1024, chunk_count);
+  
   // Retirer la tâche du watchdog à la fin
   if (wdt_initialized) {
     esp_task_wdt_delete(current_task);
@@ -307,7 +322,6 @@ error:
   
   return false;
 }
-
 
 esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
@@ -393,11 +407,11 @@ void FTPHTTPProxy::setup_http_server() {
   config.uri_match_fn = httpd_uri_match_wildcard;
   
   // Augmenter les limites pour gérer les grandes requêtes
-  config.recv_wait_timeout = 20;
-  config.send_wait_timeout = 20;
+  config.recv_wait_timeout = 30;      // Augmenté à 30 secondes
+  config.send_wait_timeout = 30;      // Augmenté à 30 secondes
   config.max_uri_handlers = 8;
   config.max_resp_headers = 20;
-  config.stack_size = 12288;
+  config.stack_size = 12288;          // Augmentation de la taille de la pile
 
   if (httpd_start(&server_, &config) != ESP_OK) {
     ESP_LOGE(TAG, "Échec du démarrage du serveur HTTP");
