@@ -20,7 +20,7 @@ void FTPHTTPProxy::setup() {
   
   // Configuration du watchdog avec un délai plus long
   esp_task_wdt_config_t wdt_config = {
-    .timeout_ms = 10000,  // Augmenter à 10 secondes (défaut est 5s)
+    .timeout_ms = 20000,  // Augmenter à 10 secondes (défaut est 5s)
     .idle_core_mask = 0,  // Sans surveillance des cœurs inactifs
     .trigger_panic = true
   };
@@ -28,7 +28,7 @@ void FTPHTTPProxy::setup() {
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "Impossible de configurer le watchdog: %d", err);
   } else {
-    ESP_LOGI(TAG, "Watchdog configuré avec timeout de 10s");
+    ESP_LOGI(TAG, "Watchdog configuré avec timeout de 20s");
   }
   
   this->setup_http_server();
@@ -141,7 +141,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
 
   // Ajuster la taille du buffer pour optimiser les performances
   // Pour les fichiers média, utiliser un buffer plus petit pour des réponses plus fréquentes
-  int buffer_size = is_media_file ? 4096 : 8192;
+  int buffer_size = is_media_file ? 4096 : 16384;
   
   // Allouer le buffer en SPIRAM
   char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
@@ -270,9 +270,9 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     
     // Yield plus souvent pour les fichiers média, mais avec un délai plus court
     if (is_media_file) {
-      vTaskDelay(pdMS_TO_TICKS(1));  // Délai minimal
+      vTaskDelay(pdMS_TO_TICKS(2));  // Délai minimal
     } else {
-      vTaskDelay(pdMS_TO_TICKS(1));
+      vTaskDelay(pdMS_TO_TICKS(2));
     }
   }
 
