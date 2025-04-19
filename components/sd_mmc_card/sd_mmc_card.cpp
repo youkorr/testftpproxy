@@ -81,21 +81,20 @@ void SdMmc::setup() {
   // Enable SDCard power if power control pin is configured
   if (this->power_ctrl_pin_ != nullptr) {
     this->power_ctrl_pin_->setup();
-    
   }
-    // Declare max_files here with a default value
-  size_t max_files = 16; // or any other appropriate value
+  
+  // Configuration améliorée pour supporter les gros fichiers
+  size_t max_files = 16;
   
   esp_vfs_fat_sdmmc_mount_config_t mount_config = {
       .format_if_mount_failed = false, 
       .max_files = max_files, 
-      .allocation_unit_size = 16 * 1024
+      .allocation_unit_size = 32 * 1024  // Augmenté à 32KB pour de meilleures performances
   };
 
   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
   host.max_freq_khz = 40000;  // Limite la fréquence à 40 MHz
-  //host.flags &= ~SDMMC_HOST_FLAG_DDR;  // ⛔ Désactiver DDR (par défaut il peut être actif si le matériel le permet)
-  host.flags |= SDMMC_HOST_FLAG_DDR;  // ✅ Activer DDR si tu veux tester la vitesse maximale (avec bus_width = 4)
+  host.flags |= SDMMC_HOST_FLAG_DDR;  // Activer DDR pour une meilleure performance
   sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
 
   if (this->mode_1bit_) {
@@ -119,24 +118,22 @@ void SdMmc::setup() {
   // Enable internal pullups on enabled pins
   slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
-  // Try to mount the SD card
-  esp_err_t ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT.c_str(), &host, &slot_config, &mount_config, &this->card_);
-  
-  // Implementation like Espressif's periph_sdcard_init
+  // Improved mounting process with retry logic
+  esp_err_t ret = ESP_FAIL;
   int retry_time = 5;
   bool mount_flag = false;
   
-  // First attempt already done above, now we'll retry if needed
-  if (ret == ESP_OK) {
-    mount_flag = true;
-  } else {
-    // Retry logic without using delays
-    while (--retry_time > 0) {
-      ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT.c_str(), &host, &slot_config, &mount_config, &this->card_);
-      if (ret == ESP_OK) {
-        mount_flag = true;
-        break;
-      }
+  // Retry logic
+  while (retry_time > 0) {
+    ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT.c_str(), &host, &slot_config, &mount_config, &this->card_);
+    if (ret == ESP_OK) {
+      mount_flag = true;
+      break;
+    }
+    retry_time--;
+    // Small delay between retries
+    for(int i=0; i<1000; i++) {
+      asm volatile("nop");  // Mini-delay sans utiliser delay()
     }
   }
 
@@ -163,12 +160,12 @@ void SdMmc::setup() {
 
 void SdMmc::write_file(const char *path, const uint8_t *buffer, size_t len) {
   ESP_LOGV(TAG, "Writing to file: %s", path);
-  this->write_file(path, buffer, len, "w");
+  this->write_file_with_wdt(path, buffer, len, "w");
 }
 
 void SdMmc::append_file(const char *path, const uint8_t *buffer, size_t len) {
   ESP_LOGV(TAG, "Appending to file: %s", path);
-  this->write_file(path, buffer, len, "a");
+  this->write_file_with_wdt(path, buffer, len, "a");
 }
 
 #ifdef USE_ESP_IDF
@@ -180,10 +177,57 @@ void SdMmc::write_file(const char *path, const uint8_t *buffer, size_t len, cons
     ESP_LOGE(TAG, "Failed to open file for writing");
     return;
   }
-  bool ok = fwrite(buffer, 1, len, file);
-  if (!ok) {
-    ESP_LOGE(TAG, "Failed to write to file");
+  
+  // Améliorer le buffer pour les opérations fichier
+  setvbuf(file, NULL, _IOFBF, 8192);  // 8KB buffer
+  
+  size_t written = fwrite(buffer, 1, len, file);
+  if (written != len) {
+    ESP_LOGE(TAG, "Failed to write to file: wrote %zu of %zu bytes", written, len);
   }
+  
+  // Assurer que les données sont écrites sur la carte
+  fsync(fileno(file));
+  fclose(file);
+  this->update_sensors();
+}
+
+// Nouvelle fonction avec gestion du watchdog
+void SdMmc::write_file_with_wdt(const char *path, const uint8_t *buffer, size_t len, const char *mode) {
+  std::string absolut_path = build_path(path);
+  FILE *file = NULL;
+  file = fopen(absolut_path.c_str(), mode);
+  if (file == NULL) {
+    ESP_LOGE(TAG, "Failed to open file for writing with WDT");
+    return;
+  }
+  
+  // Améliorer le buffer pour les opérations fichier
+  setvbuf(file, NULL, _IOFBF, 8192);  // 8KB buffer
+  
+  const size_t chunk_size = 16 * 1024; // 16KB chunks
+  size_t written = 0;
+  size_t bytes_since_reset = 0;
+  
+  while (written < len) {
+    size_t to_write = std::min(chunk_size, len - written);
+    size_t chunk_written = fwrite(buffer + written, 1, to_write, file);
+    
+    if (chunk_written != to_write) {
+      ESP_LOGE(TAG, "Failed to write chunk: wrote %zu of %zu bytes", chunk_written, to_write);
+      break;
+    }
+    
+    written += chunk_written;
+    bytes_since_reset += chunk_written;
+    
+    if (bytes_since_reset >= 32 * 1024) {
+      esp_task_wdt_reset();
+      bytes_since_reset = 0;
+    }
+  }
+  
+  fsync(fileno(file));
   fclose(file);
   this->update_sensors();
 }
@@ -197,16 +241,31 @@ void SdMmc::write_file_chunked(const char *path, const uint8_t *buffer, size_t l
     return;
   }
 
+  // Améliorer le buffer pour les opérations fichier
+  setvbuf(file, NULL, _IOFBF, 8192);  // 8KB buffer
+
   size_t written = 0;
+  size_t bytes_since_reset = 0;
+  
   while (written < len) {
     size_t to_write = std::min(chunk_size, len - written);
-    bool ok = fwrite(buffer + written, 1, to_write, file);
-    if (!ok) {
-      ESP_LOGE(TAG, "Failed to write chunk to file");
+    size_t chunk_written = fwrite(buffer + written, 1, to_write, file);
+    
+    if (chunk_written != to_write) {
+      ESP_LOGE(TAG, "Failed to write chunk: wrote %zu of %zu bytes", chunk_written, to_write);
       break;
     }
-    written += to_write;
+    
+    written += chunk_written;
+    bytes_since_reset += chunk_written;
+    
+    if (bytes_since_reset >= 32 * 1024) {
+      esp_task_wdt_reset();
+      bytes_since_reset = 0;
+    }
   }
+  
+  fsync(fileno(file));
   fclose(file);
   this->update_sensors();
 }
@@ -385,7 +444,7 @@ bool SdMmc::delete_file(const char *path) {
   return true;
 }
 
-// Lecture complète d'un fichier
+// Lecture complète d'un fichier - améliorée pour gérer les gros fichiers
 std::vector<uint8_t> SdMmc::read_file(const char *path) {
   ESP_LOGV(TAG, "Read File: %s", path);
 
@@ -396,17 +455,42 @@ std::vector<uint8_t> SdMmc::read_file(const char *path) {
     return {};
   }
 
-  std::unique_ptr<FILE, decltype(&fclose)> file_guard(file, fclose);
-  size_t file_size = this->file_size(path);
+  // Améliorer le buffer pour les opérations fichier
+  setvbuf(file, NULL, _IOFBF, 8192);  // 8KB buffer
 
+  // Utiliser fseek/ftell pour obtenir la taille du fichier
+  fseek(file, 0, SEEK_END);
+  size_t file_size = ftell(file);
+  fseek(file, 0, SEEK_SET);
+
+  // Allocation du buffer
   std::vector<uint8_t> res(file_size);
-  size_t read_len = fread(res.data(), 1, file_size, file);
-
-  if (read_len != file_size) {
-    ESP_LOGE(TAG, "Read incomplete: expected %zu bytes, got %zu (%s)", file_size, read_len, strerror(errno));
-    return {};
+  
+  // Lecture par chunks avec gestion du WDT
+  size_t total_read = 0;
+  size_t bytes_since_reset = 0;
+  const size_t chunk_size = 16 * 1024; // 16KB chunks
+  
+  while (total_read < file_size) {
+    size_t to_read = std::min(chunk_size, file_size - total_read);
+    size_t read_len = fread(res.data() + total_read, 1, to_read, file);
+    
+    if (read_len != to_read) {
+      ESP_LOGE(TAG, "Read incomplete: expected %zu bytes, got %zu (%s)", to_read, read_len, strerror(errno));
+      fclose(file);
+      return {};
+    }
+    
+    total_read += read_len;
+    bytes_since_reset += read_len;
+    
+    if (bytes_since_reset >= 32 * 1024) {
+      esp_task_wdt_reset();
+      bytes_since_reset = 0;
+    }
   }
 
+  fclose(file);
   return res;
 }
 
@@ -420,10 +504,12 @@ void SdMmc::read_file_stream(const char *path, size_t offset, size_t chunk_size,
     return;
   }
 
-  std::unique_ptr<FILE, decltype(&fclose)> file_guard(file, fclose);
+  // Améliorer le buffer pour les opérations fichier
+  setvbuf(file, NULL, _IOFBF, 8192);  // 8KB buffer
 
   if (fseek(file, offset, SEEK_SET) != 0) {
     ESP_LOGE(TAG, "Failed to seek to position %zu in file: %s (errno: %d)", offset, absolut_path.c_str(), errno);
+    fclose(file);
     return;
   }
 
@@ -444,8 +530,45 @@ void SdMmc::read_file_stream(const char *path, size_t offset, size_t chunk_size,
   if (ferror(file)) {
     ESP_LOGE(TAG, "Error reading file: %s", absolut_path.c_str());
   }
+
+  fclose(file);
 }
 
+// Nouvelle fonction pour lire un fichier par morceaux avec un offset
+std::vector<uint8_t> SdMmc::read_file_chunked(const char *path, size_t offset, size_t chunk_size) {
+  ESP_LOGV(TAG, "Read File Chunked: %s (offset: %zu, size: %zu)", path, offset, chunk_size);
+
+  std::string absolut_path = build_path(path);
+  FILE *file = fopen(absolut_path.c_str(), "rb");
+  if (file == nullptr) {
+    ESP_LOGE(TAG, "Failed to open file for chunked reading: %s", absolut_path.c_str());
+    return {};
+  }
+
+  // Améliorer le buffer pour les opérations fichier
+  setvbuf(file, NULL, _IOFBF, 8192);  // 8KB buffer
+
+  // Se positionner à l'offset demandé
+  if (fseek(file, offset, SEEK_SET) != 0) {
+    ESP_LOGE(TAG, "Failed to seek to position %zu in file: %s", offset, absolut_path.c_str());
+    fclose(file);
+    return {};
+  }
+
+  // Allocation du buffer de la taille demandée
+  std::vector<uint8_t> res(chunk_size);
+  
+  // Lecture du chunk
+  size_t read_len = fread(res.data(), 1, chunk_size, file);
+  
+  // Ajustement de la taille du vecteur aux données réellement lues
+  if (read_len < chunk_size) {
+    res.resize(read_len);
+  }
+  
+  fclose(file);
+  return res;
+}
 
 #endif
 size_t SdMmc::file_size(std::string const &path) { return this->file_size(path.c_str()); }
