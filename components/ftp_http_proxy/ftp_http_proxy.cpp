@@ -139,14 +139,17 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   if (is_media_file) {
       buffer_size = 4096;
   } else {
-      if (condition_2) {
+      if (total_bytes_transferred < 1000000) {  // Exemple de condition 2 (petits fichiers)
           buffer_size = 16384;
-      } else if (condition_3) {
+      } else if (total_bytes_transferred < 5000000) {  // Exemple de condition 3 (fichiers moyens)
           buffer_size = 32768;
-      } else {
+      } else {  // Fichiers plus grands
           buffer_size = 65535;
       }
   }
+
+ 
+
   
   // Allouer le buffer en SPIRAM
   char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
