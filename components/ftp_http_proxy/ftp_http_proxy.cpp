@@ -131,7 +131,12 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   }
 
   bool is_media_file = (extension == ".mp3" || extension == ".mp4" || 
-                        extension == ".wav" || extension == ".ogg");
+                      extension == ".wav" || extension == ".ogg" || 
+                      extension == ".avi" || extension == ".mov" || 
+                      extension == ".flv" || 
+                      extension == ".jpg" || extension == ".png" || 
+                      extension == ".bmp" || extension == ".gif" ||
+                      extension == ".pdf" || extension == ".txt");
 
   // Ajuster la taille du buffer pour optimiser les performances
   // Pour les fichiers média, utiliser un buffer plus petit pour des réponses plus fréquentes
