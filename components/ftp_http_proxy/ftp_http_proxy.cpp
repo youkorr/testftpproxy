@@ -135,7 +135,18 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
 
   // Ajuster la taille du buffer pour optimiser les performances
   // Pour les fichiers média, utiliser un buffer plus petit pour des réponses plus fréquentes
-  int buffer_size = is_media_file ? 4096 : 16384 : 32768 : 65535;
+  int buffer_size;
+  if (is_media_file) {
+      buffer_size = 4096;
+  } else {
+      if (condition_2) {
+          buffer_size = 16384;
+      } else if (condition_3) {
+          buffer_size = 32768;
+      } else {
+          buffer_size = 65535;
+      }
+  }
   
   // Allouer le buffer en SPIRAM
   char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
