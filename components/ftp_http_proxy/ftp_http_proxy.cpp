@@ -160,11 +160,9 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   size_t total_bytes_transferred = 0;
   size_t bytes_since_reset = 0;
   
-  // Obtenir le handle de la tâche actuelle pour le watchdog
   TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
   bool wdt_initialized = false;
-  
-  // Essayer d'ajouter la tâche au WDT si elle n'y est pas déjà
+
   if (esp_task_wdt_status(current_task) != ESP_OK) {
     if (esp_task_wdt_add(current_task) == ESP_OK) {
       wdt_initialized = true;
@@ -177,7 +175,6 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     ESP_LOGI(TAG, "Tâche déjà dans le watchdog");
   }
 
-  // Détecter si c'est un fichier média
   std::string extension = "";
   size_t dot_pos = remote_path.find_last_of('.');
   if (dot_pos != std::string::npos) {
@@ -185,40 +182,13 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   }
 
   bool is_media_file = (extension == ".mp3" || extension == ".mp4" || 
-                      extension == ".wav" || extension == ".ogg" || 
-                      extension == ".avi" || extension == ".mov" || 
-                      extension == ".flv" || 
-                      extension == ".jpg" || extension == ".png" || 
-                      extension == ".bmp" || extension == ".gif" ||
-                      extension == ".pdf" || extension == ".txt");
+                        extension == ".wav" || extension == ".ogg" || 
+                        extension == ".avi" || extension == ".mov" || 
+                        extension == ".flv" || extension == ".jpg" || 
+                        extension == ".png" || extension == ".bmp" || 
+                        extension == ".gif" || extension == ".pdf" || 
+                        extension == ".txt");
 
-  // Ajuster la taille du buffer pour optimiser les performances
-  // Pour les fichiers média, utiliser un buffer plus petit pour des réponses plus fréquentes
-  int buffer_size;
-  if (is_media_file) {
-      buffer_size = 4096;
-  } else {
-      if (total_bytes_transferred < 1000000) {  // Exemple de condition 2 (petits fichiers)
-          buffer_size = 16384;
-      } else if (total_bytes_transferred < 5000000) {  // Exemple de condition 3 (fichiers moyens)
-          buffer_size = 32768;
-      } else {  // Fichiers plus grands
-          buffer_size = 65535;
-      }
-  }
-
- 
-
-  
-  // Allouer le buffer en SPIRAM
-  char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
-  if (!buffer) {
-    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
-    if (wdt_initialized) esp_task_wdt_delete(current_task);
-    return false;
-  }
-
-  // Réinitialiser le watchdog avant des opérations potentiellement longues
   if (wdt_initialized) esp_task_wdt_reset();
 
   if (!connect_to_ftp()) {
@@ -226,45 +196,49 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     goto error;
   }
 
-  // Configuration spéciale pour les fichiers média
-  if (is_media_file) {
-    // Configuration correcte du type MIME
-    if (extension == ".mp3") {
-      httpd_resp_set_type(req, "audio/mpeg");
-    } else if (extension == ".wav") {
-      httpd_resp_set_type(req, "audio/wav");
-    } else if (extension == ".ogg") {
-      httpd_resp_set_type(req, "audio/ogg");
-    } else if (extension == ".mp4") {
-      httpd_resp_set_type(req, "video/mp4");
-    }
-    // Permet la mise en mémoire tampon côté client
+  // Récupérer la taille du fichier pour décision de mode (stream ou buffer)
+  char cmd[512];
+  snprintf(cmd, sizeof(cmd), "SIZE %s\r\n", remote_path.c_str());
+  send(sock_, cmd, strlen(cmd), 0);
+  char size_buf[128];
+  int size_bytes = recv(sock_, size_buf, sizeof(size_buf) - 1, 0);
+  size_buf[size_bytes] = '\0';
+
+  size_t file_size = 0;
+  if (size_bytes > 0 && strstr(size_buf, "213 ")) {
+    file_size = atoi(size_buf + 4);
+    ESP_LOGI(TAG, "Taille fichier détectée: %zu octets", file_size);
+  }
+
+  bool mp3_in_memory = (extension == ".mp3" && file_size > 0 && file_size < 8 * 1024 * 1024);
+
+  if (mp3_in_memory) {
+    httpd_resp_set_type(req, "audio/mpeg");
+  } else if (is_media_file) {
+    if (extension == ".mp3") httpd_resp_set_type(req, "audio/mpeg");
+    else if (extension == ".wav") httpd_resp_set_type(req, "audio/wav");
+    else if (extension == ".ogg") httpd_resp_set_type(req, "audio/ogg");
+    else if (extension == ".mp4") httpd_resp_set_type(req, "video/mp4");
     httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
   }
 
-  // Réinitialiser le watchdog avant des opérations de communication
   if (wdt_initialized) esp_task_wdt_reset();
 
-  // Mode passif
   send(sock_, "PASV\r\n", 6, 0);
-  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
-  if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
+  bytes_received = recv(sock_, size_buf, sizeof(size_buf) - 1, 0);
+  if (bytes_received <= 0 || !strstr(size_buf, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif");
     goto error;
   }
-  buffer[bytes_received] = '\0';
-  ESP_LOGD(TAG, "Réponse PASV: %s", buffer);
-
-  pasv_start = strchr(buffer, '(');
+  size_buf[bytes_received] = '\0';
+  pasv_start = strchr(size_buf, '(');
   if (!pasv_start) {
     ESP_LOGE(TAG, "Format PASV incorrect");
     goto error;
   }
   sscanf(pasv_start, "(%d,%d,%d,%d,%d,%d)", &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]);
   data_port = port[0] * 256 + port[1];
-  ESP_LOGD(TAG, "Port de données: %d", data_port);
 
-  // Réinitialiser le watchdog avant la création du socket
   if (wdt_initialized) esp_task_wdt_reset();
 
   data_sock = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -282,7 +256,6 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   data_addr.sin_port = htons(data_port);
   data_addr.sin_addr.s_addr = htonl((ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3]);
 
-  // Réinitialiser le watchdog avant la connexion
   if (wdt_initialized) esp_task_wdt_reset();
 
   if (::connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
@@ -290,107 +263,94 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     goto error;
   }
 
-  snprintf(buffer, buffer_size, "RETR %s\r\n", remote_path.c_str());
-  send(sock_, buffer, strlen(buffer), 0);
-
-  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
-  if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
+  snprintf(cmd, sizeof(cmd), "RETR %s\r\n", remote_path.c_str());
+  send(sock_, cmd, strlen(cmd), 0);
+  bytes_received = recv(sock_, size_buf, sizeof(size_buf) - 1, 0);
+  if (bytes_received <= 0 || !strstr(size_buf, "150 ")) {
     ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
     goto error;
   }
-  buffer[bytes_received] = '\0';
 
-  // Pour les fichiers média, envoyer en plus petits chunks avec plus de yields
-  while (true) {
-    // Réinitialiser le watchdog plus fréquemment pour les fichiers volumineux
-    // Basé sur le volume de données transférées pour s'adapter à différentes vitesses
-    bytes_received = recv(data_sock, buffer, buffer_size, 0);
-    if (bytes_received <= 0) {
-      if (bytes_received < 0) {
-        ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
-      }
-      break;
-    }
-    
-    // Mise à jour des compteurs
-    total_bytes_transferred += bytes_received;
-    bytes_since_reset += bytes_received;
-    
-    // Pour les fichiers média, réinitialiser le watchdog tous les ~100Ko
-    if (is_media_file && bytes_since_reset >= 102400 && wdt_initialized) {
-      esp_task_wdt_reset();
-      bytes_since_reset = 0;
-      ESP_LOGD(TAG, "WDT reset après ~100 Ko, total transféré: %zu Ko", total_bytes_transferred / 1024);
-    }
-    
-    esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
-      goto error;
-    }
-    
-    // Comptez les chunks pour les fichiers média pour surveiller la progression
-    chunk_count++;
-    if (is_media_file && (chunk_count % 100 == 0)) {
-      ESP_LOGD(TAG, "Streaming média: %d chunks envoyés, %zu Ko", chunk_count, total_bytes_transferred / 1024);
-    }
-    
-    // Yield plus souvent pour les fichiers média, mais avec un délai plus court
-    if (is_media_file) {
-      vTaskDelay(pdMS_TO_TICKS(2));  // Délai minimal
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(2));
-    }
+  int buffer_size = mp3_in_memory ? file_size + 1 : (is_media_file ? 4096 : 65535);
+  char *buffer = (char *)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
+  if (!buffer) {
+    ESP_LOGE(TAG, "Échec d'allocation SPIRAM");
+    goto error;
   }
 
-  // Réinitialiser le watchdog après la boucle principale
+  if (mp3_in_memory) {
+    size_t offset = 0;
+    while (offset < file_size) {
+      int len = recv(data_sock, buffer + offset, file_size - offset, 0);
+      if (len <= 0) break;
+      offset += len;
+      if (wdt_initialized) esp_task_wdt_reset();
+    }
+    httpd_resp_send(req, buffer, file_size);
+    total_bytes_transferred = file_size;
+  } else {
+    while (true) {
+      bytes_received = recv(data_sock, buffer, buffer_size, 0);
+      if (bytes_received <= 0) break;
+
+      total_bytes_transferred += bytes_received;
+      bytes_since_reset += bytes_received;
+
+      if (is_media_file && bytes_since_reset >= 102400 && wdt_initialized) {
+        esp_task_wdt_reset();
+        bytes_since_reset = 0;
+      }
+
+      esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Échec d'envoi: %d", err);
+        goto error;
+      }
+
+      chunk_count++;
+      if (is_media_file && chunk_count % 100 == 0) {
+        ESP_LOGD(TAG, "Streaming média: %d chunks, %zu Ko", chunk_count, total_bytes_transferred / 1024);
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    httpd_resp_send_chunk(req, NULL, 0);
+  }
+
   if (wdt_initialized) esp_task_wdt_reset();
 
   ::close(data_sock);
   data_sock = -1;
 
-  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
-  if (bytes_received > 0 && strstr(buffer, "226 ")) {
+  bytes_received = recv(sock_, size_buf, sizeof(size_buf) - 1, 0);
+  if (bytes_received > 0 && strstr(size_buf, "226 ")) {
     success = true;
-    buffer[bytes_received] = '\0';
-    ESP_LOGD(TAG, "Transfert terminé: %s", buffer);
+    size_buf[bytes_received] = '\0';
+    ESP_LOGD(TAG, "Transfert terminé: %s", size_buf);
   }
 
   send(sock_, "QUIT\r\n", 6, 0);
   ::close(sock_);
   sock_ = -1;
 
-  // Libérer le buffer SPIRAM
   heap_caps_free(buffer);
-  
-  httpd_resp_send_chunk(req, NULL, 0);
-  
-  // Statistiques finales
   ESP_LOGI(TAG, "Fichier transféré avec succès: %zu Ko, %d chunks", total_bytes_transferred / 1024, chunk_count);
-  
-  // Retirer la tâche du watchdog à la fin
-  if (wdt_initialized) {
-    esp_task_wdt_delete(current_task);
-  }
-  
+
+  if (wdt_initialized) esp_task_wdt_delete(current_task);
   return success;
 
 error:
-  if (buffer) heap_caps_free(buffer);
   if (data_sock != -1) ::close(data_sock);
   if (sock_ != -1) {
     send(sock_, "QUIT\r\n", 6, 0);
     ::close(sock_);
     sock_ = -1;
   }
-  
-  // Retirer la tâche du watchdog en cas d'erreur
-  if (wdt_initialized) {
-    esp_task_wdt_delete(current_task);
-  }
-  
+  if (wdt_initialized) esp_task_wdt_delete(current_task);
   return false;
 }
+
 
 esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
