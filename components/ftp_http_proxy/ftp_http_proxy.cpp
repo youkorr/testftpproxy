@@ -147,81 +147,304 @@ bool FTPHTTPProxy::connect_to_ftp() {
   return true;
 }
 
-bool FTPHTTPProxy::download_file(const std::string &filename, httpd_req_t *req) {
-  if (!this->ftp_connected_) {
-    ESP_LOGE(TAG, "FTP not connected");
+bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *req) {
+  int data_sock = -1;
+  bool success = false;
+  char *pasv_start = nullptr;
+  int data_port = 0;
+  int ip[4], port[2];
+  int bytes_received;
+  int flag = 1;
+  int rcvbuf = 32768;
+  int chunk_count = 0;
+  size_t total_bytes_transferred = 0;
+  size_t bytes_since_reset = 0;
+  
+  // Obtenir le handle de la tâche actuelle pour le watchdog
+  TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
+  bool wdt_initialized = false;
+  
+  // Essayer d'ajouter la tâche au WDT si elle n'y est pas déjà
+  if (esp_task_wdt_status(current_task) != ESP_OK) {
+    if (esp_task_wdt_add(current_task) == ESP_OK) {
+      wdt_initialized = true;
+      ESP_LOGI(TAG, "Tâche ajoutée au watchdog");
+    } else {
+      ESP_LOGW(TAG, "Impossible d'ajouter la tâche au watchdog");
+    }
+  } else {
+    wdt_initialized = true;
+    ESP_LOGI(TAG, "Tâche déjà dans le watchdog");
+  }
+
+  // Détecter si c'est un fichier média
+  std::string extension = "";
+  size_t dot_pos = remote_path.find_last_of('.');
+  if (dot_pos != std::string::npos) {
+    extension = remote_path.substr(dot_pos);
+  }
+
+  bool is_media_file = (extension == ".mp3" || extension == ".mp4" || 
+                      extension == ".wav" || extension == ".ogg" || 
+                      extension == ".avi" || extension == ".mov" || 
+                      extension == ".flv" || 
+                      extension == ".jpg" || extension == ".png" || 
+                      extension == ".bmp" || extension == ".gif" ||
+                      extension == ".pdf" || extension == ".txt");
+  
+  // Variable pour déterminer si c'est un petit fichier MP3 (pour téléchargement rapide)
+  bool is_small_mp3 = false;
+  size_t file_size = 0;
+
+  // Ajuster la taille du buffer pour optimiser les performances
+  // Pour les fichiers média, utiliser un buffer plus petit pour des réponses plus fréquentes
+  int buffer_size;
+  if (is_media_file) {
+      buffer_size = 4096;
+  } else {
+      if (total_bytes_transferred < 1000000) {  // Exemple de condition 2 (petits fichiers)
+          buffer_size = 16384;
+      } else if (total_bytes_transferred < 5000000) {  // Exemple de condition 3 (fichiers moyens)
+          buffer_size = 32768;
+      } else {  // Fichiers plus grands
+          buffer_size = 65535;
+      }
+  }
+
+  // Allouer le buffer en SPIRAM
+  char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
+  if (!buffer) {
+    ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
+    if (wdt_initialized) esp_task_wdt_delete(current_task);
     return false;
   }
 
-  // Initialisations déplacées en haut
-  int size_bytes;
-  size_t file_size;
-  bool mp3_in_memory;
-  bool is_media_file;
-  int buffer_size;
-  char *buffer = nullptr;
-  FILE *fp = nullptr;
+  // Réinitialiser le watchdog avant des opérations potentiellement longues
+  if (wdt_initialized) esp_task_wdt_reset();
 
-  std::string extension = get_file_extension(filename);
-  is_media_file = (extension == ".mp3" || extension == ".wav" || extension == ".mp4" || extension == ".mkv");
-
-  this->send_command("RETR " + filename, 150);
-  int sock_ = this->data_connection();
-  if (sock_ < 0) {
+  if (!connect_to_ftp()) {
+    ESP_LOGE(TAG, "Échec de connexion FTP");
     goto error;
   }
 
-  // Lire la taille du fichier (ou d'un header personnalisé)
-  char size_buf[16] = {0};
-  size_bytes = recv(sock_, size_buf, sizeof(size_buf) - 1, 0);
-  if (size_bytes <= 0) {
-    ESP_LOGE(TAG, "Failed to read file size");
-    goto error;
-  }
-
-  file_size = atoi(size_buf);
-  mp3_in_memory = (extension == ".mp3" && file_size > 0 && file_size < 8 * 1024 * 1024);
-
-  buffer_size = mp3_in_memory ? file_size + 1 : (is_media_file ? 4096 : 65535);
-  buffer = (char *)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
-  if (!buffer) {
-    ESP_LOGE(TAG, "Failed to allocate buffer");
-    goto error;
-  }
-
-  if (mp3_in_memory) {
-    // Lecture complète en RAM
-    size_t total_read = 0;
-    while (total_read < file_size) {
-      int read_bytes = recv(sock_, buffer + total_read, file_size - total_read, 0);
-      if (read_bytes <= 0) break;
-      total_read += read_bytes;
-    }
-    buffer[total_read] = '\0';
-    httpd_resp_set_type(req, "audio/mpeg");
-    httpd_resp_send(req, buffer, total_read);
-  } else {
-    // Lecture bloc par bloc
-    httpd_resp_set_type(req, get_mime_type(extension.c_str()));
-    while (true) {
-      int read_bytes = recv(sock_, buffer, buffer_size, 0);
-      if (read_bytes <= 0) break;
-      if (httpd_resp_send_chunk(req, buffer, read_bytes) != ESP_OK) {
-        ESP_LOGE(TAG, "Error sending chunk");
-        goto error;
+  // Pour les fichiers MP3, vérifier d'abord la taille avec SIZE
+  if (extension == ".mp3") {
+    snprintf(buffer, buffer_size, "SIZE %s\r\n", remote_path.c_str());
+    send(sock_, buffer, strlen(buffer), 0);
+    
+    bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
+    if (bytes_received > 0) {
+      buffer[bytes_received] = '\0';
+      // Analyser la réponse du serveur pour obtenir la taille
+      if (strstr(buffer, "213 ")) {  // Code de réponse SIZE standard
+        sscanf(buffer, "213 %zu", &file_size);
+        ESP_LOGI(TAG, "Taille du fichier MP3: %zu octets", file_size);
+        
+        // Déterminer si c'est un petit MP3 (moins de 8Mo)
+        if (file_size < 8 * 1024 * 1024) {
+          is_small_mp3 = true;
+          ESP_LOGI(TAG, "Petit fichier MP3 détecté, utilisation du mode téléchargement rapide");
+        }
       }
-      esp_task_wdt_reset();  // Protection WDT
     }
-    httpd_resp_send_chunk(req, nullptr, 0);  // Fin
   }
 
-  if (buffer) free(buffer);
-  close(sock_);
-  return true;
+  // Configuration spéciale pour les fichiers média
+  if (is_media_file) {
+    // Configuration correcte du type MIME
+    if (extension == ".mp3") {
+      httpd_resp_set_type(req, "audio/mpeg");
+      
+      // Pour les petits MP3, indiquer au navigateur de télécharger plutôt que de streamer
+      if (is_small_mp3) {
+        httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=download.mp3");
+      } else {
+        // Pour les MP3 plus grands, permettre le streaming
+        httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
+      }
+    } else if (extension == ".wav") {
+      httpd_resp_set_type(req, "audio/wav");
+      httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
+    } else if (extension == ".ogg") {
+      httpd_resp_set_type(req, "audio/ogg");
+      httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
+    } else if (extension == ".mp4") {
+      httpd_resp_set_type(req, "video/mp4");
+      httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
+    }
+  }
+
+  // Réinitialiser le watchdog avant des opérations de communication
+  if (wdt_initialized) esp_task_wdt_reset();
+
+  // Mode passif
+  send(sock_, "PASV\r\n", 6, 0);
+  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
+  if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
+    ESP_LOGE(TAG, "Erreur en mode passif");
+    goto error;
+  }
+  buffer[bytes_received] = '\0';
+  ESP_LOGD(TAG, "Réponse PASV: %s", buffer);
+
+  pasv_start = strchr(buffer, '(');
+  if (!pasv_start) {
+    ESP_LOGE(TAG, "Format PASV incorrect");
+    goto error;
+  }
+  sscanf(pasv_start, "(%d,%d,%d,%d,%d,%d)", &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]);
+  data_port = port[0] * 256 + port[1];
+  ESP_LOGD(TAG, "Port de données: %d", data_port);
+
+  // Réinitialiser le watchdog avant la création du socket
+  if (wdt_initialized) esp_task_wdt_reset();
+
+  data_sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (data_sock < 0) {
+    ESP_LOGE(TAG, "Échec de création du socket de données");
+    goto error;
+  }
+
+  setsockopt(data_sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+  setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+  struct sockaddr_in data_addr;
+  memset(&data_addr, 0, sizeof(data_addr));
+  data_addr.sin_family = AF_INET;
+  data_addr.sin_port = htons(data_port);
+  data_addr.sin_addr.s_addr = htonl((ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3]);
+
+  // Réinitialiser le watchdog avant la connexion
+  if (wdt_initialized) esp_task_wdt_reset();
+
+  if (::connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
+    ESP_LOGE(TAG, "Échec de connexion au port de données");
+    goto error;
+  }
+
+  snprintf(buffer, buffer_size, "RETR %s\r\n", remote_path.c_str());
+  send(sock_, buffer, strlen(buffer), 0);
+
+  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
+  if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
+    ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
+    goto error;
+  }
+  buffer[bytes_received] = '\0';
+
+  // Adapter la taille du buffer et la fréquence de yield selon le type de fichier
+  // Pour les petits MP3, utiliser un buffer plus grand pour un téléchargement rapide
+  if (is_small_mp3 && buffer_size < 32768) {
+    heap_caps_free(buffer);
+    buffer_size = 32768;  // Utiliser un buffer plus grand pour les petits MP3
+    buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
+    if (!buffer) {
+      ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
+      goto error;
+    }
+  }
+
+  // Pour les fichiers média, envoyer en plus petits chunks avec plus de yields
+  while (true) {
+    // Réinitialiser le watchdog plus fréquemment pour les fichiers volumineux
+    bytes_received = recv(data_sock, buffer, buffer_size, 0);
+    if (bytes_received <= 0) {
+      if (bytes_received < 0) {
+        ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
+      }
+      break;
+    }
+    
+    // Mise à jour des compteurs
+    total_bytes_transferred += bytes_received;
+    bytes_since_reset += bytes_received;
+    
+    // Pour les fichiers média (sauf petits MP3), réinitialiser le watchdog tous les ~100Ko
+    if (is_media_file && !is_small_mp3 && bytes_since_reset >= 102400 && wdt_initialized) {
+      esp_task_wdt_reset();
+      bytes_since_reset = 0;
+      ESP_LOGD(TAG, "WDT reset après ~100 Ko, total transféré: %zu Ko", total_bytes_transferred / 1024);
+    }
+    // Pour les petits MP3, réinitialiser moins fréquemment pour optimiser la vitesse
+    else if (is_small_mp3 && bytes_since_reset >= 512000 && wdt_initialized) {
+      esp_task_wdt_reset();
+      bytes_since_reset = 0;
+    }
+    
+    esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
+      goto error;
+    }
+    
+    // Comptez les chunks pour les fichiers média pour surveiller la progression
+    chunk_count++;
+    if (is_media_file && !is_small_mp3 && (chunk_count % 100 == 0)) {
+      ESP_LOGD(TAG, "Streaming média: %d chunks envoyés, %zu Ko", chunk_count, total_bytes_transferred / 1024);
+    }
+    
+    // Yield différent selon le type de fichier
+    if (is_media_file && !is_small_mp3) {
+      vTaskDelay(pdMS_TO_TICKS(2));  // Délai minimal pour le streaming
+    } else if (is_small_mp3) {
+      // Pour les petits MP3, yield moins fréquemment pour optimiser la vitesse
+      if (chunk_count % 10 == 0) {
+        vTaskDelay(pdMS_TO_TICKS(1));  // Délai très court pour les petits MP3
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+  }
+
+  // Réinitialiser le watchdog après la boucle principale
+  if (wdt_initialized) esp_task_wdt_reset();
+
+  ::close(data_sock);
+  data_sock = -1;
+
+  bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
+  if (bytes_received > 0 && strstr(buffer, "226 ")) {
+    success = true;
+    buffer[bytes_received] = '\0';
+    ESP_LOGD(TAG, "Transfert terminé: %s", buffer);
+  }
+
+  send(sock_, "QUIT\r\n", 6, 0);
+  ::close(sock_);
+  sock_ = -1;
+
+  // Libérer le buffer SPIRAM
+  heap_caps_free(buffer);
+  
+  httpd_resp_send_chunk(req, NULL, 0);
+  
+  // Statistiques finales
+  ESP_LOGI(TAG, "Fichier transféré avec succès: %zu Ko, %d chunks", total_bytes_transferred / 1024, chunk_count);
+  if (is_small_mp3) {
+    ESP_LOGI(TAG, "Petit MP3 transféré en mode téléchargement rapide");
+  }
+  
+  // Retirer la tâche du watchdog à la fin
+  if (wdt_initialized) {
+    esp_task_wdt_delete(current_task);
+  }
+  
+  return success;
 
 error:
-  if (buffer) free(buffer);
-  if (sock_ >= 0) close(sock_);
+  if (buffer) heap_caps_free(buffer);
+  if (data_sock != -1) ::close(data_sock);
+  if (sock_ != -1) {
+    send(sock_, "QUIT\r\n", 6, 0);
+    ::close(sock_);
+    sock_ = -1;
+  }
+  
+  // Retirer la tâche du watchdog en cas d'erreur
+  if (wdt_initialized) {
+    esp_task_wdt_delete(current_task);
+  }
+  
   return false;
 }
 
