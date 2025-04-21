@@ -20,20 +20,13 @@ void FTPHTTPProxy::setup() {
   struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
   
   // Configuration du watchdog avec un délai plus long
-  esp_task_wdt_config_t wdt_config = {
-    .timeout_ms = 20000,  // Augmenter à 10 secondes (défaut est 5s)
-    .idle_core_mask = 0,  // Sans surveillance des cœurs inactifs
-    .trigger_panic = true
-  };
-  esp_err_t err = esp_task_wdt_init(&wdt_config);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "Impossible de configurer le watchdog: %d", err);
-  } else {
-    ESP_LOGI(TAG, "Watchdog configuré avec timeout de 20s");
-  }
+  ESP_LOGI(TAG, "Initialisation du proxy FTP/HTTP");
+
+  // Aucune configuration du watchdog n'est effectuée ici
   
   this->setup_http_server();
 }
+
 
 void FTPHTTPProxy::loop() {}
 
@@ -55,7 +48,7 @@ bool FTPHTTPProxy::connect_to_ftp() {
   setsockopt(sock_, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
   
   // Augmenter la taille du buffer de réception
-  int rcvbuf = 16384;
+  int rcvbuf = 32768;
   setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
   struct sockaddr_in server_addr;
