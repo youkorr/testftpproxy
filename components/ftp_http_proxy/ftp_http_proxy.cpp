@@ -142,7 +142,7 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   // Pour les fichiers média, utiliser un buffer plus petit pour des réponses plus fréquentes
   int buffer_size;
   if (is_media_file) {
-      buffer_size = 1024;
+      buffer_size = 4096;
   } else {
       if (total_bytes_transferred < 1000000) {  // Exemple de condition 2 (petits fichiers)
           buffer_size = 16384;
