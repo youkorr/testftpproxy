@@ -9,63 +9,12 @@
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
 
-struct TransferContext {
-  httpd_req_t *req;
-  int data_sock;
-  char *buffer;
-  size_t buffer_size;
-  bool is_media_file;
-};
 
 
 static const char *TAG = "ftp_proxy";
 
 namespace esphome {
 namespace ftp_http_proxy {
-
-void file_transfer_task(void *param) {
-  TransferContext *ctx = static_cast<TransferContext *>(param);
-  char *buffer = ctx->buffer;
-  size_t buffer_size = ctx->buffer_size;
-  httpd_req_t *req = ctx->req;
-  int data_sock = ctx->data_sock;
-
-  TickType_t last_wdt_feed = xTaskGetTickCount();
-  const TickType_t wdt_timeout = pdMS_TO_TICKS(10000);  // 10 secondes
-  int total_sent = 0;
-
-  while (true) {
-    int bytes_read = recv(data_sock, buffer, buffer_size, 0);
-    if (bytes_read <= 0) break;
-
-    esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_read);
-    if (err != ESP_OK) {
-      ESP_LOGE("FTPHTTPProxy", "Erreur envoi HTTP: %s", esp_err_to_name(err));
-      break;
-    }
-
-    total_sent += bytes_read;
-
-    if (xTaskGetTickCount() - last_wdt_feed > wdt_timeout / 2) {
-      esp_task_wdt_reset();
-      last_wdt_feed = xTaskGetTickCount();
-    }
-
-    if (ctx->is_media_file) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-    } else {
-      taskYIELD();  // Laisse respirer les autres tâches
-    }
-  }
-
-  close(data_sock);
-  httpd_resp_send_chunk(req, nullptr, 0);
-  delete[] buffer;
-  delete ctx;
-
-  ESP_LOGI("FTPHTTPProxy", "Transfert terminé, %d octets envoyés.", total_sent);
-  vTaskDelete(nullptr);
-}
 
 
 void FTPHTTPProxy::setup() {
@@ -391,7 +340,6 @@ error:
   
   return false;
 }
-
 
 esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
