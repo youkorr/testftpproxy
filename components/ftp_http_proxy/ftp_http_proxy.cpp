@@ -160,15 +160,9 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   size_t total_bytes_transferred = 0;
   size_t bytes_since_reset = 0;
   
-  // Stockage en mémoire RTC pour suivre les redémarrages WDT
-  static RTC_NOINIT_ATTR uint32_t wdt_reset_count = 0;
-  
   // Obtenir le handle de la tâche actuelle pour le watchdog
   TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
   bool wdt_initialized = false;
-  
-  // Sauvegarder la priorité originale de la tâche
-  UBaseType_t original_priority = uxTaskPriorityGet(NULL);
   
   // Essayer d'ajouter la tâche au WDT si elle n'y est pas déjà
   if (esp_task_wdt_status(current_task) != ESP_OK) {
@@ -197,32 +191,12 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
                       extension == ".jpg" || extension == ".png" || 
                       extension == ".bmp" || extension == ".gif" ||
                       extension == ".pdf" || extension == ".txt");
-  
-  // Variable pour déterminer si c'est un petit fichier MP3 (pour téléchargement rapide)
-  bool is_small_mp3 = false;
-  size_t file_size = 0;
-
-  // Traitement spécial pour les MP3 après reboot
-  if (extension == ".mp3") {
-    wdt_reset_count++;
-    if (wdt_reset_count > 1) {
-      ESP_LOGW(TAG, "Détecté %d redémarrages WDT consécutifs, mode ultra-sécurisé activé", wdt_reset_count);
-      // Réduire drastiquement le buffer et augmenter les timeouts en mode sécurisé
-      buffer_size = 1024;
-      // Autres paramètres conservateurs seront appliqués
-    }
-  } else {
-    wdt_reset_count = 0;
-  }
 
   // Ajuster la taille du buffer pour optimiser les performances
   // Pour les fichiers média, utiliser un buffer plus petit pour des réponses plus fréquentes
   int buffer_size;
   if (is_media_file) {
-      // Si mode ultra-sécurisé est activé, on respecte la valeur déjà assignée
-      if (!(extension == ".mp3" && wdt_reset_count > 1)) {
-          buffer_size = 4096;
-      }
+      buffer_size = 4096;
   } else {
       if (total_bytes_transferred < 1000000) {  // Exemple de condition 2 (petits fichiers)
           buffer_size = 16384;
@@ -233,19 +207,15 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
       }
   }
 
+ 
+
+  
   // Allouer le buffer en SPIRAM
   char* buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
   if (!buffer) {
     ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
     if (wdt_initialized) esp_task_wdt_delete(current_task);
     return false;
-  }
-
-  // Réduire la priorité pour les fichiers média
-  if (is_media_file && !is_small_mp3) {
-    // Réduire la priorité en dessous de la tâche de décodage média
-    vTaskPrioritySet(NULL, tskIDLE_PRIORITY + 1);
-    ESP_LOGI(TAG, "Priorité de tâche réduite pour le streaming média");
   }
 
   // Réinitialiser le watchdog avant des opérations potentiellement longues
@@ -256,88 +226,20 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     goto error;
   }
 
-  // Pour les fichiers MP3, vérifier d'abord la taille avec SIZE
-  if (extension == ".mp3") {
-    // Augmenter le timeout du watchdog pour les fichiers MP3
-    if (wdt_initialized) {
-      // Augmenter le timeout à 45 secondes pour les opérations MP3 (au lieu de 30)
-      esp_task_wdt_config_t wdt_config = {
-        .timeout_ms = 45000,
-        .idle_core_mask = 0,  // Ne pas compter les cœurs inactifs
-        .trigger_panic = true
-      };
-      esp_task_wdt_reconfigure(&wdt_config);
-      
-      // Obtenir aussi le handle de loopTask et l'ajouter au watchdog si nécessaire
-      TaskHandle_t loop_task_handle = xTaskGetHandle("loopTask");
-      if (loop_task_handle && esp_task_wdt_status(loop_task_handle) != ESP_OK) {
-        esp_task_wdt_add(loop_task_handle);
-        ESP_LOGI(TAG, "loopTask ajoutée au watchdog pour le traitement MP3");
-      }
-      
-      ESP_LOGI(TAG, "Timeout du watchdog augmenté pour le traitement MP3");
-      esp_task_wdt_reset();
-    }
-    
-    snprintf(buffer, buffer_size, "SIZE %s\r\n", remote_path.c_str());
-    send(sock_, buffer, strlen(buffer), 0);
-    
-    bytes_received = recv(sock_, buffer, buffer_size - 1, 0);
-    if (bytes_received > 0) {
-      buffer[bytes_received] = '\0';
-      // Analyser la réponse du serveur pour obtenir la taille
-      if (strstr(buffer, "213 ")) {  // Code de réponse SIZE standard
-        sscanf(buffer, "213 %zu", &file_size);
-        ESP_LOGI(TAG, "Taille du fichier MP3: %zu octets", file_size);
-        
-        // Déterminer si c'est un petit MP3 (moins de 8Mo)
-        if (file_size < 8 * 1024 * 1024) {
-          is_small_mp3 = true;
-          ESP_LOGI(TAG, "Petit fichier MP3 détecté, utilisation du mode téléchargement rapide");
-        } else {
-          ESP_LOGI(TAG, "Grand fichier MP3 détecté, utilisation du mode streaming avec précautions");
-          
-          // Pour les grands MP3, réduire la taille du buffer pour éviter les blocages
-          if (wdt_reset_count <= 1) {  // Si pas en mode ultra-sécurisé
-            buffer_size = 2048;  // Chunks plus petits pour les grands MP3
-            ESP_LOGI(TAG, "Grand fichier MP3: utilisation d'un buffer réduit pour éviter blocage WDT");
-            
-            // Réallouer le buffer avec la nouvelle taille
-            heap_caps_free(buffer);
-            buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
-            if (!buffer) {
-              ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer réduit");
-              goto error;
-            }
-          }
-        }
-      }
-    }
-  }
-
   // Configuration spéciale pour les fichiers média
   if (is_media_file) {
     // Configuration correcte du type MIME
     if (extension == ".mp3") {
       httpd_resp_set_type(req, "audio/mpeg");
-      
-      // Pour les petits MP3, indiquer au navigateur de télécharger plutôt que de streamer
-      if (is_small_mp3) {
-        httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=download.mp3");
-      } else {
-        // Pour les MP3 plus grands, permettre le streaming
-        httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
-      }
     } else if (extension == ".wav") {
       httpd_resp_set_type(req, "audio/wav");
-      httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
     } else if (extension == ".ogg") {
       httpd_resp_set_type(req, "audio/ogg");
-      httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
     } else if (extension == ".mp4") {
       httpd_resp_set_type(req, "video/mp4");
-      httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
     }
+    // Permet la mise en mémoire tampon côté client
+    httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
   }
 
   // Réinitialiser le watchdog avant des opérations de communication
@@ -398,33 +300,10 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   }
   buffer[bytes_received] = '\0';
 
-  // Adapter la taille du buffer et la fréquence de yield selon le type de fichier
-  // Pour les petits MP3, utiliser un buffer plus grand pour un téléchargement rapide
-  if (is_small_mp3 && buffer_size < 32768 && wdt_reset_count <= 1) {
-    heap_caps_free(buffer);
-    buffer_size = 32768;  // Utiliser un buffer plus grand pour les petits MP3
-    buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
-    if (!buffer) {
-      ESP_LOGE(TAG, "Échec d'allocation SPIRAM pour le buffer");
-      goto error;
-    }
-  }
-
   // Pour les fichiers média, envoyer en plus petits chunks avec plus de yields
   while (true) {
-    // Réinitialiser le watchdog AVANT chaque lecture de données pour éviter les timeouts
-    if (wdt_initialized) {
-      esp_task_wdt_reset();
-      
-      // Si c'est un MP3, réinitialiser aussi le watchdog pour loopTask
-      if (extension == ".mp3") {
-        TaskHandle_t loop_task_handle = xTaskGetHandle("loopTask");
-        if (loop_task_handle && esp_task_wdt_status(loop_task_handle) == ESP_OK) {
-          esp_task_wdt_reset_task(loop_task_handle);
-        }
-      }
-    }
-    
+    // Réinitialiser le watchdog plus fréquemment pour les fichiers volumineux
+    // Basé sur le volume de données transférées pour s'adapter à différentes vitesses
     bytes_received = recv(data_sock, buffer, buffer_size, 0);
     if (bytes_received <= 0) {
       if (bytes_received < 0) {
@@ -437,23 +316,11 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     total_bytes_transferred += bytes_received;
     bytes_since_reset += bytes_received;
     
-    // Pour tous les fichiers MP3, réinitialiser le watchdog après CHAQUE chunk
-    // pour éviter les problèmes de timeout pendant le décodage du média
-    if (extension == ".mp3" && wdt_initialized) {
-      esp_task_wdt_reset();
-      
-      // Journalisation par palier de 1 MB pour surveiller la progression
-      if (total_bytes_transferred % (1024*1024) == 0) {
-        ESP_LOGW(TAG, "MP3 transfer milestone: %zu MB", total_bytes_transferred / (1024*1024));
-      } else {
-        ESP_LOGD(TAG, "WDT reset pendant transfert MP3, total transféré: %zu Ko", total_bytes_transferred / 1024);
-      }
-    }
-    // Pour les autres fichiers média, réinitialiser tous les ~50Ko (plus fréquent qu'avant)
-    else if (is_media_file && bytes_since_reset >= 51200 && wdt_initialized) {
+    // Pour les fichiers média, réinitialiser le watchdog tous les ~100Ko
+    if (is_media_file && bytes_since_reset >= 102400 && wdt_initialized) {
       esp_task_wdt_reset();
       bytes_since_reset = 0;
-      ESP_LOGD(TAG, "WDT reset après ~50 Ko, total transféré: %zu Ko", total_bytes_transferred / 1024);
+      ESP_LOGD(TAG, "WDT reset après ~100 Ko, total transféré: %zu Ko", total_bytes_transferred / 1024);
     }
     
     esp_err_t err = httpd_resp_send_chunk(req, buffer, bytes_received);
@@ -464,28 +331,15 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
     
     // Comptez les chunks pour les fichiers média pour surveiller la progression
     chunk_count++;
-    if (is_media_file && !is_small_mp3 && (chunk_count % 100 == 0)) {
+    if (is_media_file && (chunk_count % 100 == 0)) {
       ESP_LOGD(TAG, "Streaming média: %d chunks envoyés, %zu Ko", chunk_count, total_bytes_transferred / 1024);
     }
     
-    // Yield plus fréquemment pour tous les MP3 pour éviter les problèmes de watchdog
-    if (extension == ".mp3") {
-      // Pour tous les MP3, faire un yield à chaque chunk
-      if (!is_small_mp3) {
-        // Yield plus long pour les grands MP3
-        vTaskDelay(pdMS_TO_TICKS(10));  // Augmenté de 5ms à 10ms
-        
-        // Introduire périodiquement des yields plus longs pour les grands fichiers
-        if (chunk_count % 20 == 0) {
-          vTaskDelay(pdMS_TO_TICKS(50));  // Tous les 20 chunks, yield plus long
-        }
-      } else {
-        vTaskDelay(pdMS_TO_TICKS(5));  // Délai pour les petits MP3
-      }
-    } else if (is_media_file && !is_small_mp3) {
-      vTaskDelay(pdMS_TO_TICKS(2));  // Délai minimal pour le streaming d'autres médias
+    // Yield plus souvent pour les fichiers média, mais avec un délai plus court
+    if (is_media_file) {
+      vTaskDelay(pdMS_TO_TICKS(2));  // Délai minimal
     } else {
-      vTaskDelay(pdMS_TO_TICKS(1));  // Délai court pour les autres fichiers
+      vTaskDelay(pdMS_TO_TICKS(2));
     }
   }
 
@@ -513,41 +367,10 @@ bool FTPHTTPProxy::download_file(const std::string &remote_path, httpd_req_t *re
   
   // Statistiques finales
   ESP_LOGI(TAG, "Fichier transféré avec succès: %zu Ko, %d chunks", total_bytes_transferred / 1024, chunk_count);
-  if (is_small_mp3) {
-    ESP_LOGI(TAG, "Petit MP3 transféré en mode téléchargement rapide");
-  }
-  
-  // Restaurer la priorité de la tâche si elle a été modifiée
-  if (is_media_file && !is_small_mp3) {
-    vTaskPrioritySet(NULL, original_priority);
-    ESP_LOGI(TAG, "Priorité de tâche restaurée après streaming média");
-  }
   
   // Retirer la tâche du watchdog à la fin
   if (wdt_initialized) {
-    // Si c'était un MP3, restaurer les paramètres par défaut du watchdog 
-    // avant de supprimer la tâche
-    if (extension == ".mp3") {
-      // Restaurer la configuration par défaut du watchdog
-      esp_task_wdt_config_t default_wdt_config = {
-        .timeout_ms = 5000,  // Remettez la valeur par défaut
-        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
-        .trigger_panic = true
-      };
-      esp_task_wdt_reconfigure(&default_wdt_config);
-      
-      // Supprimer également loopTask du watchdog si on l'avait ajouté
-      TaskHandle_t loop_task_handle = xTaskGetHandle("loopTask");
-      if (loop_task_handle && esp_task_wdt_status(loop_task_handle) == ESP_OK) {
-        esp_task_wdt_delete(loop_task_handle);
-      }
-    }
     esp_task_wdt_delete(current_task);
-  }
-  
-  // Réinitialiser le compteur de reset WDT en cas de succès pour les MP3
-  if (extension == ".mp3") {
-    wdt_reset_count = 0;
   }
   
   return success;
@@ -561,34 +384,13 @@ error:
     sock_ = -1;
   }
   
-  // Restaurer la priorité de la tâche si elle a été modifiée
-  if (is_media_file && !is_small_mp3) {
-    vTaskPrioritySet(NULL, original_priority);
-  }
-  
   // Retirer la tâche du watchdog en cas d'erreur
   if (wdt_initialized) {
-    // Si c'était un MP3, supprimer également loopTask du watchdog
-    if (extension == ".mp3") {
-      // Restaurer la configuration par défaut du watchdog
-      esp_task_wdt_config_t default_wdt_config = {
-        .timeout_ms = 5000,
-        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
-        .trigger_panic = true
-      };
-      esp_task_wdt_reconfigure(&default_wdt_config);
-      
-      TaskHandle_t loop_task_handle = xTaskGetHandle("loopTask");
-      if (loop_task_handle && esp_task_wdt_status(loop_task_handle) == ESP_OK) {
-        esp_task_wdt_delete(loop_task_handle);
-      }
-    }
     esp_task_wdt_delete(current_task);
   }
   
   return false;
 }
-
 
 
 esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
