@@ -89,12 +89,13 @@ void SdMmc::setup() {
     .max_files = 16,
     .allocation_unit_size = 64 * 1024  // 64KB optimise l'écriture des fichiers
   };
-
   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
   host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;  // 50MHz
   
-  // Activer DMA et DDR seulement en mode 4 bits
-  host.flags |= SDMMC_HOST_FLAG_DMA;
+  // Dans les versions récentes d'ESP-IDF, DMA est généralement activé par défaut
+  // ou configuré différemment, donc on n'ajoute pas SDMMC_HOST_FLAG_DMA
+  
+  // Activer DDR seulement en mode 4 bits
   if (!this->mode_1bit_) {
     host.flags |= SDMMC_HOST_FLAG_DDR;
   } else {
@@ -109,14 +110,12 @@ void SdMmc::setup() {
   slot_config.clk = static_cast<gpio_num_t>(this->clk_pin_);
   slot_config.cmd = static_cast<gpio_num_t>(this->cmd_pin_);
   slot_config.d0 = static_cast<gpio_num_t>(this->data0_pin_);
-
   if (!this->mode_1bit_) {
     slot_config.d1 = static_cast<gpio_num_t>(this->data1_pin_);
     slot_config.d2 = static_cast<gpio_num_t>(this->data2_pin_);
     slot_config.d3 = static_cast<gpio_num_t>(this->data3_pin_);
   }
   #endif
-
   // Enable internal pullups
   slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
   
@@ -131,7 +130,6 @@ void SdMmc::setup() {
     }
     vTaskDelay(pdMS_TO_TICKS(100));  // Pause entre tentatives
   }
-
   if (ret != ESP_OK) {
     if (ret == ESP_FAIL) {
       this->init_error_ = ErrorCode::ERR_MOUNT;
@@ -143,7 +141,6 @@ void SdMmc::setup() {
     mark_failed();
     return;
   }
-
   // Diagnostic de la carte
   ESP_LOGI(TAG, "SD Card Info:");
   ESP_LOGI(TAG, "  Name: %s", this->card_->cid.name);
@@ -155,10 +152,8 @@ void SdMmc::setup() {
   if (this->sd_card_type_text_sensor_ != nullptr)
     this->sd_card_type_text_sensor_->publish_state(sd_card_type());
   #endif
-
   update_sensors();
 }
-
 #endif
 
 void SdMmc::write_file(const char *path, const uint8_t *buffer, size_t len) {
