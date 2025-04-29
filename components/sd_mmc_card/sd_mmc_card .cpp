@@ -78,33 +78,34 @@ void SdMmc::dump_config() {
 }
 #ifdef USE_ESP_IDF
 void SdMmc::setup() {
-  // Enable SDCard power if power control pin is configured
+  // Power control
   if (this->power_ctrl_pin_ != nullptr) {
     this->power_ctrl_pin_->setup();
-    
   }
-    // Declare max_files here with a default value
-  size_t max_files = 16; // or any other appropriate value
   
+  // Configuration optimale
   esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-      .format_if_mount_failed = false, 
-      .max_files = max_files, 
-      .allocation_unit_size = 16 * 1024
+    .format_if_mount_failed = false,
+    .max_files = 16,
+    .allocation_unit_size = 64 * 1024  // 64KB optimise l'écriture des fichiers
   };
 
   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-  host.max_freq_khz = 40000;  // Limite la fréquence à 40 MHz
-  //host.flags &= ~SDMMC_HOST_FLAG_DDR;  // ⛔ Désactiver DDR (par défaut il peut être actif si le matériel le permet)
-  host.flags |= SDMMC_HOST_FLAG_DDR;  // ✅ Activer DDR si tu veux tester la vitesse maximale (avec bus_width = 4)
-  sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-
-  if (this->mode_1bit_) {
-    slot_config.width = 1;
+  host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;  // 50MHz
+  
+  // Activer DMA et DDR seulement en mode 4 bits
+  host.flags |= SDMMC_HOST_FLAG_DMA;
+  if (!this->mode_1bit_) {
+    host.flags |= SDMMC_HOST_FLAG_DDR;
   } else {
-    slot_config.width = 4;
+    host.flags &= ~SDMMC_HOST_FLAG_DDR;
   }
-
-#ifdef SOC_SDMMC_USE_GPIO_MATRIX
+  
+  sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+  slot_config.width = this->mode_1bit_ ? 1 : 4;
+  
+  // Configuration des pins
+  #ifdef SOC_SDMMC_USE_GPIO_MATRIX
   slot_config.clk = static_cast<gpio_num_t>(this->clk_pin_);
   slot_config.cmd = static_cast<gpio_num_t>(this->cmd_pin_);
   slot_config.d0 = static_cast<gpio_num_t>(this->data0_pin_);
@@ -114,33 +115,24 @@ void SdMmc::setup() {
     slot_config.d2 = static_cast<gpio_num_t>(this->data2_pin_);
     slot_config.d3 = static_cast<gpio_num_t>(this->data3_pin_);
   }
-#endif
+  #endif
 
-  // Enable internal pullups on enabled pins
+  // Enable internal pullups
   slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-  // Try to mount the SD card
-  esp_err_t ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT.c_str(), &host, &slot_config, &mount_config, &this->card_);
   
-  // Implementation like Espressif's periph_sdcard_init
-  int retry_time = 5;
-  bool mount_flag = false;
-  
-  // First attempt already done above, now we'll retry if needed
-  if (ret == ESP_OK) {
-    mount_flag = true;
-  } else {
-    // Retry logic without using delays
-    while (--retry_time > 0) {
-      ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT.c_str(), &host, &slot_config, &mount_config, &this->card_);
-      if (ret == ESP_OK) {
-        mount_flag = true;
-        break;
-      }
+  // Try to mount with optimized retry logic
+  esp_err_t ret = ESP_FAIL;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    ESP_LOGI(TAG, "Mounting SD Card (attempt %d/3)...", attempt);
+    ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT.c_str(), &host, &slot_config, &mount_config, &this->card_);
+    if (ret == ESP_OK) {
+      ESP_LOGI(TAG, "SD Card mounted successfully!");
+      break;
     }
+    vTaskDelay(pdMS_TO_TICKS(100));  // Pause entre tentatives
   }
 
-  if (!mount_flag) {
+  if (ret != ESP_OK) {
     if (ret == ESP_FAIL) {
       this->init_error_ = ErrorCode::ERR_MOUNT;
       ESP_LOGE(TAG, "Failed to mount filesystem on SD card");
@@ -152,13 +144,21 @@ void SdMmc::setup() {
     return;
   }
 
-#ifdef USE_TEXT_SENSOR
+  // Diagnostic de la carte
+  ESP_LOGI(TAG, "SD Card Info:");
+  ESP_LOGI(TAG, "  Name: %s", this->card_->cid.name);
+  ESP_LOGI(TAG, "  Type: %s", sd_card_type().c_str());
+  ESP_LOGI(TAG, "  Speed: %d kHz (max: %d kHz)", this->card_->max_freq_khz, SDMMC_FREQ_HIGHSPEED);
+  ESP_LOGI(TAG, "  Size: %llu MB", ((uint64_t)this->card_->csd.capacity * this->card_->csd.sector_size) / (1024 * 1024));
+  
+  #ifdef USE_TEXT_SENSOR
   if (this->sd_card_type_text_sensor_ != nullptr)
     this->sd_card_type_text_sensor_->publish_state(sd_card_type());
-#endif
+  #endif
 
   update_sensors();
 }
+
 #endif
 
 void SdMmc::write_file(const char *path, const uint8_t *buffer, size_t len) {
