@@ -21,18 +21,18 @@ static const std::string MOUNT_POINT = "/sdcard";
 namespace esphome {
 namespace sd_mmc_card {
 
-long double convertBytes(uint64_t value, MemoryUnits unit) {
+long double convertBytes(uint64_t bytes, MemoryUnits unit) {
   switch (unit) {
-    case BYTES:
-      return static_cast<long double>(value);
-    case KILOBYTES:
-      return static_cast<long double>(value) / 1024.0;
-    case MEGABYTES:
-      return static_cast<long double>(value) / (1024.0 * 1024.0);
-    case GIGABYTES:
-      return static_cast<long double>(value) / (1024.0 * 1024.0 * 1024.0);
+    case BYTE:  // Changed from BYTES to BYTE
+      return bytes;
+    case KILOBYTE:  // Changed from KILOBYTES to KILOBYTE
+      return bytes / 1024.0;
+    case MEGABYTE:  // Changed from MEGABYTES to MEGABYTE
+      return bytes / (1024.0 * 1024.0);
+    case GIGABYTE:  // Changed from GIGABYTES to GIGABYTE
+      return bytes / (1024.0 * 1024.0 * 1024.0);
     default:
-      return static_cast<long double>(value);
+      return bytes;
   }
 }
 
@@ -589,10 +589,10 @@ void SdMmc::set_mode_1bit(bool b) { this->mode_1bit_ = b; }
 
 void SdMmc::set_power_ctrl_pin(GPIOPin *pin) { this->power_ctrl_pin_ = pin; }
 
-std::string SdMmc::error_code_to_string(SdMmc::ErrorCode code) {
+std::string SdMmc::error_code_to_string(ErrorCode code) {
   switch (code) {
     case ErrorCode::NONE:
-      return "No Error";
+      return "None";
     case ErrorCode::MOUNT_FAILED:
       return "Mount Failed";
     case ErrorCode::INIT_FAILED:
@@ -600,7 +600,7 @@ std::string SdMmc::error_code_to_string(SdMmc::ErrorCode code) {
     case ErrorCode::CARD_NOT_FOUND:
       return "Card Not Found";
     default:
-      return "Unknown Error (" + std::to_string(static_cast<int>(code)) + ")";
+      return "Unknown Error";
   }
 }
 
