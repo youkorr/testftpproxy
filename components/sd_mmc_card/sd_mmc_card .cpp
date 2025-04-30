@@ -77,28 +77,11 @@ void SdMmc::dump_config() {
   }
 }
 #ifdef USE_ESP_IDF
+
 void SdMmc::setup() {
-  ESP_LOGCONFIG(TAG, "Setting up SD MMC...");
-  
   // Power control
   if (this->power_ctrl_pin_ != nullptr) {
     this->power_ctrl_pin_->setup();
-    this->power_ctrl_pin_->digital_write(false);
-    delay(100);  // Attendre que la carte se décharge
-    this->power_ctrl_pin_->digital_write(true);
-    delay(100);  // Attendre que la carte s'initialise
-  }
-  
-  // Désactiver explicitement la résistance pull-up sur GPIO12 (DATA3) avant tout
-  if (!this->mode_1bit_ && this->data3_pin_ == 12) {
-    gpio_config_t io_conf = {};
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_INPUT_OUTPUT;
-    io_conf.pin_bit_mask = (1ULL << 12);
-    io_conf.pull_down_en = 0;
-    io_conf.pull_up_en = 0;
-    gpio_config(&io_conf);
-    ESP_LOGD(TAG, "GPIO12 pull-up disabled for SD card DATA3");
   }
   
   // Configuration optimale
@@ -107,12 +90,11 @@ void SdMmc::setup() {
     .max_files = 16,
     .allocation_unit_size = 64 * 1024  // 64KB optimise l'écriture des fichiers
   };
-  
   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
   host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;  // 50MHz
   
-  // Activer DMA pour des performances optimales
-  host.flags |= SDMMC_HOST_FLAG_DMA;
+  // Dans les versions récentes d'ESP-IDF, DMA est généralement activé par défaut
+  // ou configuré différemment, donc on n'ajoute pas SDMMC_HOST_FLAG_DMA
   
   // Activer DDR seulement en mode 4 bits
   if (!this->mode_1bit_) {
@@ -121,11 +103,7 @@ void SdMmc::setup() {
     host.flags &= ~SDMMC_HOST_FLAG_DDR;
   }
   
-  // Désactiver les résistances pull-up internes de l'hôte SDMMC
   sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-  slot_config.flags &= ~SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-  
-  // Configuration de la largeur du bus
   slot_config.width = this->mode_1bit_ ? 1 : 4;
   
   // Configuration des pins
@@ -133,70 +111,51 @@ void SdMmc::setup() {
   slot_config.clk = static_cast<gpio_num_t>(this->clk_pin_);
   slot_config.cmd = static_cast<gpio_num_t>(this->cmd_pin_);
   slot_config.d0 = static_cast<gpio_num_t>(this->data0_pin_);
-  
   if (!this->mode_1bit_) {
     slot_config.d1 = static_cast<gpio_num_t>(this->data1_pin_);
     slot_config.d2 = static_cast<gpio_num_t>(this->data2_pin_);
     slot_config.d3 = static_cast<gpio_num_t>(this->data3_pin_);
   }
   #endif
+  // Enable internal pullups
+  slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
   
-  // Tentatives de montage de la carte
-  const int max_attempts = 3;
-  for (int attempt = 1; attempt <= max_attempts; attempt++) {
-    ESP_LOGI(TAG, "Mounting SD Card (attempt %d/%d)...", attempt, max_attempts);
-    
-    // Réinitialiser GPIO12 à nouveau avant la nouvelle tentative si c'est DATA3
-    if (!this->mode_1bit_ && this->data3_pin_ == 12) {
-      gpio_pullup_dis(static_cast<gpio_num_t>(12));
-      gpio_pulldown_dis(static_cast<gpio_num_t>(12));
-      delay(50);
-    }
-    
-    esp_err_t ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &this->card_);
-    
+  // Try to mount with optimized retry logic
+  esp_err_t ret = ESP_FAIL;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    ESP_LOGI(TAG, "Mounting SD Card (attempt %d/3)...", attempt);
+    ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT.c_str(), &host, &slot_config, &mount_config, &this->card_);
     if (ret == ESP_OK) {
       ESP_LOGI(TAG, "SD Card mounted successfully!");
       break;
     }
-    
-    ESP_LOGW(TAG, "SD Card mount failed (attempt %d/%d): %s", attempt, max_attempts, esp_err_to_name(ret));
-    
-    if (attempt < max_attempts) {
-      delay(500);  // Attendre avant la prochaine tentative
-    } else {
-      this->init_error_ = ret;
-      this->mark_failed();
-      return;
-    }
+    vTaskDelay(pdMS_TO_TICKS(100));  // Pause entre tentatives
   }
-  
-  if (this->is_failed()) {
+  if (ret != ESP_OK) {
+    if (ret == ESP_FAIL) {
+      this->init_error_ = ErrorCode::ERR_MOUNT;
+      ESP_LOGE(TAG, "Failed to mount filesystem on SD card");
+    } else {
+      this->init_error_ = ErrorCode::ERR_NO_CARD;
+      ESP_LOGE(TAG, "No SD card detected");
+    }
+    mark_failed();
     return;
   }
+  // Diagnostic de la carte
+  ESP_LOGI(TAG, "SD Card Info:");
+  ESP_LOGI(TAG, "  Name: %s", this->card_->cid.name);
+  ESP_LOGI(TAG, "  Type: %s", sd_card_type().c_str());
+  ESP_LOGI(TAG, "  Speed: %d kHz (max: %d kHz)", this->card_->max_freq_khz, SDMMC_FREQ_HIGHSPEED);
+  ESP_LOGI(TAG, "  Size: %llu MB", ((uint64_t)this->card_->csd.capacity * this->card_->csd.sector_size) / (1024 * 1024));
   
-  // Informations sur la carte montée
-  sdmmc_card_t *card = this->card_;
-  ESP_LOGI(TAG, "SD Card Information:");
-  ESP_LOGI(TAG, "  Name: %s", card->cid.name);
-  ESP_LOGI(TAG, "  Type: %s", (card->ocr & SD_OCR_SDHC_CAP) ? "SDHC/SDXC" : "SDSC");
-  ESP_LOGI(TAG, "  Speed: %s", (card->csd.tr_speed > 25000000) ? "High Speed" : "Default Speed");
-  ESP_LOGI(TAG, "  Size: %lluMB", ((uint64_t) card->csd.capacity) * card->csd.sector_size / (1024 * 1024));
-  ESP_LOGI(TAG, "  CSD Version: %s", (card->csd.csd_ver == 0) ? "1.0" : "2.0");
-  ESP_LOGI(TAG, "  Freq: %ukHz", card->max_freq_khz);
-  
-  card_->real_freq_khz = card->max_freq_khz;
-  card_->max_freq_khz = card->max_freq_khz;
-  card_->is_ddr = !!(host.flags & SDMMC_HOST_FLAG_DDR);
-  
-  // Mise à jour des capteurs si activés
-#ifdef USE_SENSOR
-  if (this->total_space_sensor_ != nullptr || this->free_space_sensor_ != nullptr || this->used_space_sensor_ != nullptr ||
-      !this->file_size_sensors_.empty()) {
-    this->set_update_interval(this->update_interval_);
-  }
+  #ifdef USE_TEXT_SENSOR
+  if (this->sd_card_type_text_sensor_ != nullptr)
+    this->sd_card_type_text_sensor_->publish_state(sd_card_type());
+  #endif
+  update_sensors();
+}
 #endif
-
 void SdMmc::write_file(const char *path, const uint8_t *buffer, size_t len) {
   ESP_LOGV(TAG, "Writing to file: %s", path);
   this->write_file(path, buffer, len, "w");
