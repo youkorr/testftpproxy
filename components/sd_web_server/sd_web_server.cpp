@@ -1,12 +1,6 @@
 #include "sd_web_server.h"
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <dirent.h>
-#include <cstring>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <arpa/inet.h>
+#include "esp_log.h"
+#include "lwip/sockets.h"
 
 namespace esphome {
 namespace sd_web_server {
@@ -19,7 +13,9 @@ void SDWebServer::setup() {
 
 void SDWebServer::server_task(void *pv) {
   SDWebServer *self = static_cast<SDWebServer *>(pv);
-  int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+
+  // Création du socket
+  int sock = socket(AF_INET, SOCK_STREAM, 0);
   if (sock < 0) {
     ESP_LOGE(TAG, "Socket creation failed");
     vTaskDelete(nullptr);
@@ -31,19 +27,35 @@ void SDWebServer::server_task(void *pv) {
   server_addr.sin_port = htons(self->port_);
   server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-  bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
-  listen(sock, 2);
+  // Lier le socket à l'adresse IP et au port
+  if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    ESP_LOGE(TAG, "Socket bind failed");
+    close(sock);
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  // Ecouter les connexions entrantes
+  if (listen(sock, 2) < 0) {
+    ESP_LOGE(TAG, "Listen failed");
+    close(sock);
+    vTaskDelete(nullptr);
+    return;
+  }
 
   ESP_LOGI(TAG, "WebDAV server running on port %d", self->port_);
 
   while (true) {
+    // Attendre une connexion entrante
     int client_sock = accept(sock, nullptr, nullptr);
     if (client_sock >= 0) {
+      // Traiter la requête client
       handle_client(client_sock, self->sd_dir_);
       close(client_sock);
     }
   }
 }
+
 
 void SDWebServer::handle_client(int client_sock, const std::string &sd_dir) {
   char buffer[1024];
