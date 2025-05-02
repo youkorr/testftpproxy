@@ -1,173 +1,157 @@
 #include "sd_web_server.h"
-#include "esp_log.h"
 #include "lwip/sockets.h"
+#include "esp_log.h"
+#include <dirent.h>
+#include <sys/stat.h>
+
+static const char *TAG = "SD_WEB";
 
 namespace esphome {
 namespace sd_web_server {
 
-static const char *TAG = "sd_webdav";
+const char* SDWebServer::get_mime_type(const char *filename) {
+  const char *dot = strrchr(filename, '.');
+  if (!dot) return "application/octet-stream";
+  
+  static const struct {
+    const char *ext;
+    const char *mime;
+  } mime_types[] = {
+    {".html", "text/html"}, {".js", "application/javascript"}, 
+    {".css", "text/css"}, {".jpg", "image/jpeg"},
+    {".png", "image/png"}, {".mp3", "audio/mpeg"},
+    {".mp4", "video/mp4"}, {".txt", "text/plain"},
+    {".json", "application/json"}
+  };
 
-void SDWebServer::setup() {
-  xTaskCreate(&SDWebServer::server_task, "webdav_server", 8192, this, 5, &server_task_);
-}
-
-void SDWebServer::server_task(void *pv) {
-  SDWebServer *self = static_cast<SDWebServer *>(pv);
-
-  // Création du socket
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
-  if (sock < 0) {
-    ESP_LOGE(TAG, "Socket creation failed");
-    vTaskDelete(nullptr);
-    return;
+  for (const auto &mt : mime_types) {
+    if (strcasecmp(dot, mt.ext) == 0) return mt.mime;
   }
-
-  sockaddr_in server_addr{};
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_port = htons(self->port_);
-  server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-  // Lier le socket à l'adresse IP et au port
-  if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-    ESP_LOGE(TAG, "Socket bind failed");
-    close(sock);
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  // Ecouter les connexions entrantes
-  if (listen(sock, 2) < 0) {
-    ESP_LOGE(TAG, "Listen failed");
-    close(sock);
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  ESP_LOGI(TAG, "WebDAV server running on port %d", self->port_);
-
-  while (true) {
-    // Attendre une connexion entrante
-    int client_sock = accept(sock, nullptr, nullptr);
-    if (client_sock >= 0) {
-      // Traiter la requête client
-      handle_client(client_sock, self->sd_dir_);
-      close(client_sock);
-    }
-  }
-}
-
-
-void SDWebServer::handle_client(int client_sock, const std::string &sd_dir) {
-  char buffer[1024];
-  int len = recv(client_sock, buffer, sizeof(buffer) - 1, 0);
-  if (len <= 0) return;
-  buffer[len] = 0;
-
-  std::string request(buffer);
-  std::string method, path;
-  size_t m_end = request.find(' ');
-  size_t p_end = request.find(' ', m_end + 1);
-
-  if (m_end == std::string::npos || p_end == std::string::npos) return;
-  method = request.substr(0, m_end);
-  path = request.substr(m_end + 1, p_end - m_end - 1);
-  std::string fs_path = sd_dir + path;
-
-  ESP_LOGI(TAG, "Method: %s, Path: %s", method.c_str(), path.c_str());
-
-  struct stat st;
-  std::string response;
-
-  if (method == "GET") {
-    if (stat(fs_path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
-      FILE *f = fopen(fs_path.c_str(), "rb");
-      if (f) {
-        std::string header = build_http_response("200 OK", get_mime_type(fs_path), "");
-        send(client_sock, header.c_str(), header.size(), 0);
-        char filebuf[512];
-        size_t r;
-        while ((r = fread(filebuf, 1, sizeof(filebuf), f)) > 0) {
-          send(client_sock, filebuf, r, 0);
-        }
-        fclose(f);
-        return;
-      }
-    }
-    response = build_http_response("404 Not Found", "text/plain", "File not found");
-  }
-
-  else if (method == "PUT") {
-    FILE *f = fopen(fs_path.c_str(), "wb");
-    if (!f) {
-      response = build_http_response("500 Internal Server Error", "text/plain", "Cannot create file");
-    } else {
-      const char *body = strstr(buffer, "\r\n\r\n");
-      if (body) {
-        body += 4;
-        fwrite(body, 1, len - (body - buffer), f);
-        // Could also read more from recv if needed
-      }
-      fclose(f);
-      response = build_http_response("201 Created", "text/plain", "File written");
-    }
-  }
-
-  else if (method == "PROPFIND") {
-    if (stat(fs_path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
-      response = build_http_response("404 Not Found", "text/plain", "Not a directory");
-    } else {
-      std::string xml = "<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\">";
-      DIR *dir = opendir(fs_path.c_str());
-      if (dir) {
-        struct dirent *entry;
-        while ((entry = readdir(dir))) {
-          std::string name(entry->d_name);
-          if (name == "." || name == "..") continue;
-          xml += "<d:response><d:href>" + path + "/" + name + "</d:href><d:propstat><d:prop><d:resourcetype/>";
-          xml += "</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>";
-        }
-        closedir(dir);
-      }
-      xml += "</d:multistatus>";
-      response = build_http_response("207 Multi-Status", "application/xml", xml);
-    }
-  }
-
-  else if (method == "DELETE") {
-    if (remove(fs_path.c_str()) == 0) {
-      response = build_http_response("200 OK", "text/plain", "Deleted");
-    } else {
-      response = build_http_response("404 Not Found", "text/plain", "Delete failed");
-    }
-  }
-
-  else {
-    response = build_http_response("405 Method Not Allowed", "text/plain", "Unsupported method");
-  }
-
-  send(client_sock, response.c_str(), response.size(), 0);
-}
-
-std::string SDWebServer::build_http_response(const std::string &status, const std::string &content_type, const std::string &body) {
-  char header[256];
-  snprintf(header, sizeof(header),
-           "HTTP/1.1 %s\r\n"
-           "Content-Type: %s\r\n"
-           "Content-Length: %d\r\n"
-           "Connection: close\r\n\r\n",
-           status.c_str(), content_type.c_str(), (int)body.size());
-  return std::string(header) + body;
-}
-
-std::string SDWebServer::get_mime_type(const std::string &filename) {
-  if (filename.ends_with(".html")) return "text/html";
-  if (filename.ends_with(".jpg")) return "image/jpeg";
-  if (filename.ends_with(".png")) return "image/png";
-  if (filename.ends_with(".json")) return "application/json";
-  if (filename.ends_with(".txt")) return "text/plain";
   return "application/octet-stream";
 }
 
-}  // namespace sd_web_server
-}  // namespace esphome
+void SDWebServer::send_directory_listing(httpd_req_t *req, const char *path) {
+  DIR *dir = opendir(path);
+  if (!dir) {
+    httpd_resp_send_404(req);
+    return;
+  }
+
+  std::string html = R"(
+<html><head><title>Index of )" + std::string(path) + R"(</title>
+<style>
+.grid { 
+  display: grid; 
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 1rem;
+  padding: 1rem;
+}
+.item {
+  border: 1px solid #ddd;
+  padding: 1rem;
+  text-align: center;
+}
+img { max-width: 100%; height: auto; }
+</style></head><body>
+<h1>Index of )" + std::string(path) + R"(</h1><div class="grid">)";
+
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (entry->d_name == '.') continue;
+    
+    std::string full_path = std::string(path) + "/" + entry->d_name;
+    struct stat st;
+    stat(full_path.c_str(), &st);
+
+    html += "<div class='item'>";
+    html += "<a href='" + std::string(entry->d_name) + "'>";
+    
+    if (S_ISDIR(st.st_mode)) {
+      html += "📁 <strong>" + std::string(entry->d_name) + "</strong>";
+    } else {
+      html += "📄 " + std::string(entry->d_name);
+      if (strstr(entry->d_name, ".jpg") || strstr(entry->d_name, ".png")) {
+        html += "<br><img src='" + std::string(entry->d_name) + "' loading='lazy'>";
+      }
+    }
+    
+    html += "</a><br><small>" + std::to_string(st.st_size / 1024) + " KB</small>";
+    html += "</div>";
+  }
+  closedir(dir);
+  
+  html += "</div></body></html>";
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_send(req, html.c_str(), html.size());
+}
+
+void SDWebServer::send_file(httpd_req_t *req, const char *path) {
+  FILE *file = fopen(path, "rb");
+  if (!file) {
+    httpd_resp_send_404(req);
+    return;
+  }
+
+  const size_t buffer_size = 4096;
+  char *buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
+  if (!buffer) {
+    fclose(file);
+    httpd_resp_send_500(req);
+    return;
+  }
+
+  httpd_resp_set_type(req, get_mime_type(path));
+  
+  size_t bytes_read;
+  while ((bytes_read = fread(buffer, 1, buffer_size, file)) > 0) {
+    if (httpd_resp_send_chunk(req, buffer, bytes_read) != ESP_OK) break;
+  }
+
+  heap_caps_free(buffer);
+  fclose(file);
+  httpd_resp_send_chunk(req, NULL, 0);
+}
+
+esp_err_t SDWebServer::request_handler(httpd_req_t *req) {
+  char path[128];
+  snprintf(path, sizeof(path), "/sd%s", req->uri);
+  
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+
+  if (S_ISDIR(st.st_mode)) {
+    send_directory_listing(req, path);
+  } else {
+    send_file(req, path);
+  }
+  
+  return ESP_OK;
+}
+
+void SDWebServer::setup() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = port_;
+  config.ctrl_port = port_ + 1;
+  config.max_uri_handlers = 8;
+  config.stack_size = 8192;
+  config.lru_purge_enable = true;
+
+  if (httpd_start(&server_, &config) == ESP_OK) {
+    httpd_uri_t uri = {
+      .uri = "/*",
+      .method = HTTP_GET,
+      .handler = request_handler,
+      .user_ctx = this
+    };
+    httpd_register_uri_handler(server_, &uri);
+    ESP_LOGI(TAG, "Serveur web SD démarré sur le port %d", port_);
+  }
+}
+
+} // namespace sd_web_server
+} // namespace esphome
+
 
