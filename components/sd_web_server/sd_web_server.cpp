@@ -3,6 +3,10 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <arpa/inet.h>
 
 namespace esphome {
 namespace sd_web_server {
